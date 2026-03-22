@@ -41,7 +41,7 @@ server.tool(
     tool_name: z.string().optional().describe('Filter to blocks from a specific tool (e.g. "Read", "Bash", "Edit")'),
     limit: z.number().optional().describe('Max results to return (default 20)'),
     snippet_length: z.number().optional().describe('Max characters per snippet (default 300). If a result ends with "..." it was truncated — retry with a larger value (e.g. 5000) or use flightlog_get_session to read the full transcript.'),
-    include: z.array(z.string()).optional().describe('Opt-in extra fields: "token_counts" (input/output/cache tokens), "version" (Claude Code version), "uuid" (message ID), "cwd" (working directory). Default results already include session_id, project, timestamp, role, model, git_branch, block_type, tool_name, snippet.'),
+    include: z.array(z.string()).optional().describe('Array of extra field keys to add to each result. Valid keys: "token_counts" (adds input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens), "version" (Claude Code version string), "uuid" (message ID), "cwd" (working directory). Example: ["token_counts", "version"]. Default results already include session_id, project, timestamp, role, model, git_branch, block_type, tool_name, snippet — use this parameter only when you need fields beyond those.'),
   },
   async (params) => handleSearch(params),
 );
