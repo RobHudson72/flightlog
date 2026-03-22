@@ -103,6 +103,16 @@ Flightlog handles concurrent access from multiple Claude Code instances out of t
 
 Each agent's MCP server instance shares the same database. Auto-ingest runs every 5 seconds, so one agent can search another agent's recent conversation within seconds.
 
+## What's Searchable
+
+| Block Type | Searchable Content | Notes |
+|------------|-------------------|-------|
+| `text` | Full assistant text output | DoD results, status updates, explanations |
+| `user_text` | Full user messages | Prompts, questions, instructions |
+| `tool_use` | Tool name + input parameters | Search for "gh pr create", file paths, commands |
+| `tool_result` | Tool output content | File contents, command output, API responses |
+| `thinking` | Not searchable | Claude Code does not persist thinking content to JSONL logs — only an encrypted signature is stored. This is a Claude Code limitation, not a Flightlog limitation. If Anthropic enables thinking persistence in the future, Flightlog will index it automatically. |
+
 ## Performance
 
 | Metric | Value |

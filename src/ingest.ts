@@ -155,7 +155,7 @@ function extractContentBlocks(line: JsonlLine): ContentBlockRow[] {
               message_uuid: messageUuid,
               block_index: i,
               block_type: 'tool_use',
-              text_content: null,
+              text_content: JSON.stringify(block.input),
               tool_name: block.name,
               tool_input: JSON.stringify(block.input),
             });
