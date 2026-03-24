@@ -212,6 +212,17 @@ export interface IngestProgress {
   errors: string[];
 }
 
+export interface TailResult {
+  session_id: string;
+  timestamp: string;
+  role: string | null;
+  model: string | null;
+  git_branch: string | null;
+  block_type: string;
+  tool_name: string | null;
+  snippet: string;
+}
+
 export interface SearchFilters {
   project?: string;
   session_id?: string;
