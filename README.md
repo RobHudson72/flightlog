@@ -65,12 +65,27 @@ Restart Claude Code. Flightlog automatically discovers and ingests your conversa
 |------|-------------|
 | `flightlog_search` | Search past conversations with filters for project, date range, role, block type, and tool name |
 | `flightlog_get_session` | Retrieve the full transcript of a session, optionally including tool inputs/outputs |
+| `flightlog_tail` | Get the last N messages from a session, most recent first — the "what is this agent doing right now?" query |
 | `flightlog_list_sessions` | Browse sessions with metadata, git branch, and a preview of the first message |
 | `flightlog_ingest` | Trigger ingestion manually — processes most recent conversations first, runs in background |
 | `flightlog_ingest_status` | Check ingestion progress: files processed, percent complete, current file |
 | `flightlog_stats` | Database statistics: session count, messages, disk size, compression ratio |
 | `flightlog_delete_sessions` | Remove sessions by ID, date, or project |
 | `flightlog_rebuild` | Drop and recreate the database from scratch |
+
+### Checking on Agents
+
+`flightlog_tail` is designed for the coordinator use case — checking what an agent is doing without knowing what keywords to search for. Two calls, deterministic, no keyword guessing:
+
+```
+# Step 1: find the agent's session
+flightlog_list_sessions(git_branch="task/agent-v8") → session_id
+
+# Step 2: see what it's doing now
+flightlog_tail(session_id, limit=5, block_type="text") → last 5 text messages
+```
+
+Parameters: `session_id` (required), `limit` (default 20), `include_tool_io` (default false), `block_type` (filter to specific type), `snippet_length` (default 500).
 
 ### Search Filters
 

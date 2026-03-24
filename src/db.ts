@@ -12,6 +12,7 @@ import type {
   IngestLogRow,
   TranscriptMessage,
   TranscriptBlock,
+  TailResult,
 } from './types.js';
 
 // ── Database connection management ──────────────────────────────
@@ -401,6 +402,57 @@ export function listSessions(
   `).all(...params, limit, offset) as RowData[];
 
   return rows as unknown as SessionSummary[];
+}
+
+export function tailSession(
+  db: Database.Database,
+  sessionId: string,
+  filters: {
+    limit?: number;
+    include_tool_io?: boolean;
+    block_type?: string;
+    snippet_length?: number;
+  },
+): TailResult[] {
+  const limit = filters.limit ?? 20;
+  const snippetLength = filters.snippet_length ?? 500;
+
+  const whereClauses: string[] = ['m.session_id = ?'];
+  const params: unknown[] = [sessionId];
+
+  if (!filters.include_tool_io) {
+    whereClauses.push(`cb.block_type NOT IN ('tool_use', 'tool_result')`);
+  }
+  if (filters.block_type) {
+    whereClauses.push(`cb.block_type = ?`);
+    params.push(filters.block_type);
+  }
+
+  const whereStr = whereClauses.join(' AND ');
+
+  const sql = `
+    SELECT
+      m.session_id,
+      m.timestamp,
+      m.role,
+      m.model,
+      s.git_branch,
+      cb.block_type,
+      cb.tool_name,
+      CASE
+        WHEN LENGTH(cb.text_content) > ${snippetLength} THEN SUBSTR(cb.text_content, 1, ${snippetLength}) || '...'
+        ELSE cb.text_content
+      END AS snippet
+    FROM content_blocks cb
+    JOIN messages m ON m.uuid = cb.message_uuid
+    JOIN sessions s ON s.session_id = m.session_id
+    WHERE ${whereStr}
+    ORDER BY m.timestamp DESC, cb.block_index DESC
+    LIMIT ?
+  `;
+
+  params.push(limit);
+  return db.prepare(sql).all(...params) as unknown as TailResult[];
 }
 
 export function getStats(db: Database.Database): StatsResult {

@@ -3,6 +3,7 @@ import {
   searchContentBlocks,
   getSessionMessages,
   listSessions,
+  tailSession,
   getStats,
   deleteSessions,
   getIngestStatus,
@@ -136,6 +137,35 @@ export async function handleGetSession(params: {
     return ok(detail);
   } catch (e) {
     return errFromCatch('flightlog_get_session', e);
+  }
+}
+
+export async function handleTail(params: {
+  session_id: string;
+  limit?: number;
+  include_tool_io?: boolean;
+  block_type?: string;
+  snippet_length?: number;
+}) {
+  try {
+    const db = getDb();
+    const start = performance.now();
+    const results = tailSession(db, params.session_id, {
+      limit: params.limit,
+      include_tool_io: params.include_tool_io,
+      block_type: params.block_type,
+      snippet_length: params.snippet_length,
+    });
+    const queryMs = Math.round(performance.now() - start);
+
+    return ok({
+      session_id: params.session_id,
+      result_count: results.length,
+      query_ms: queryMs,
+      results,
+    });
+  } catch (e) {
+    return errFromCatch('flightlog_tail', e);
   }
 }
 

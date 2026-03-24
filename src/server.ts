@@ -7,6 +7,7 @@ import { z } from 'zod';
 import {
   handleSearch,
   handleGetSession,
+  handleTail,
   handleListSessions,
   handleIngest,
   handleStats,
@@ -54,6 +55,19 @@ server.tool(
     include_tool_io: z.boolean().optional().describe('Include tool_use inputs and tool_result outputs in transcript (default false)'),
   },
   async (params) => handleGetSession(params),
+);
+
+server.tool(
+  'flightlog_tail',
+  'Get the last N messages from a Claude Code session, most recent first. Use this to check what an agent is currently doing without needing keywords. Much faster than flightlog_get_session for active sessions — returns only recent activity instead of the full transcript.',
+  {
+    session_id: z.string().describe('Session UUID to tail (from flightlog_list_sessions results)'),
+    limit: z.number().optional().describe('Number of messages to return (default 20)'),
+    include_tool_io: z.boolean().optional().describe('Include tool_use inputs and tool_result outputs (default false — excluded to reduce noise)'),
+    block_type: z.string().optional().describe('Filter to a specific block type: text, thinking, tool_use, tool_result, or user_text'),
+    snippet_length: z.number().optional().describe('Max characters per message snippet (default 500)'),
+  },
+  async (params) => handleTail(params),
 );
 
 server.tool(
