@@ -223,6 +223,21 @@ export interface TailResult {
   snippet: string;
 }
 
+export interface SyncState {
+  last_synced_block_id: number;
+  last_sync_at: string | null;
+  last_sync_error: string | null;
+}
+
+export interface SyncResult {
+  sessions_synced: number;
+  messages_synced: number;
+  blocks_synced: number;
+  high_water_mark: number;
+  duration_ms: number;
+  error: string | null;
+}
+
 export interface SearchFilters {
   project?: string;
   session_id?: string;

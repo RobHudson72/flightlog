@@ -72,6 +72,7 @@ Restart Claude Code. Flightlog automatically discovers and ingests your conversa
 | `flightlog_stats` | Database statistics: session count, messages, disk size, compression ratio |
 | `flightlog_delete_sessions` | Remove sessions by ID, date, or project |
 | `flightlog_rebuild` | Drop and recreate the database from scratch |
+| `flightlog_sync` | Manually trigger sync to remote PostgreSQL (requires `FLIGHTLOG_SYNC_URL`) |
 
 ### Checking on Agents
 
@@ -142,6 +143,43 @@ Each agent's MCP server instance shares the same database. Auto-ingest runs ever
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
 | `FLIGHTLOG_DB_PATH` | `~/.flightlog/flightlog.db` | Database file location |
+| `FLIGHTLOG_SYNC_URL` | *(not set)* | PostgreSQL connection string to enable remote sync |
+| `FLIGHTLOG_SYNC_INTERVAL` | `60` | Seconds between background sync cycles |
+| `FLIGHTLOG_SYNC_ACTIVE_ONLY` | `true` | Only sync sessions with activity in the last 2 hours |
+
+## PostgreSQL Sync (Optional)
+
+Flightlog can sync local session data to a remote PostgreSQL database, enabling web-based dashboards to read conversation data from any device. This is opt-in — when `FLIGHTLOG_SYNC_URL` is not set, behavior is unchanged.
+
+### Setup
+
+Set the connection string in your `.env` file or environment:
+
+```bash
+FLIGHTLOG_SYNC_URL=postgresql://user:password@host:5432/flightlog
+```
+
+The Postgres schema (sessions, messages, content_blocks) is created automatically on first sync. Sync is incremental — only new rows are pushed each cycle.
+
+### Usage
+
+**Background sync** starts automatically when the MCP server detects `FLIGHTLOG_SYNC_URL`. It logs sync activity to stderr.
+
+**Manual sync** for testing:
+
+```bash
+# Via npm script
+npm run sync
+
+# Or directly
+node dist/sync-cli.js
+```
+
+**MCP tool**: `flightlog_sync` triggers one sync cycle from within Claude Code.
+
+### Resilience
+
+Sync is best-effort. If the remote database is unreachable, Flightlog logs a warning and retries next cycle. Sync failures never affect local operations — all MCP tools continue working normally.
 
 ## Data Retention
 

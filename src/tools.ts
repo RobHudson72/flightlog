@@ -277,6 +277,23 @@ export async function handleIngestStatus() {
   }
 }
 
+export async function handleSync() {
+  try {
+    const { isSyncConfigured, runSyncCycle } = await import('./sync.js');
+    if (!isSyncConfigured()) {
+      return err('PostgreSQL sync is not configured. Set the FLIGHTLOG_SYNC_URL environment variable.');
+    }
+    const db = getDb();
+    const result = await runSyncCycle(db);
+    if (result.error) {
+      return ok({ message: 'Sync completed with error', ...result });
+    }
+    return ok({ message: 'Sync completed successfully', ...result });
+  } catch (e) {
+    return errFromCatch('flightlog_sync', e);
+  }
+}
+
 export async function handleRebuild() {
   try {
     const db = getDb();
