@@ -5,23 +5,27 @@
   "type": "module",
   "main": "dist/server.js",
   "bin": {
-    "mcp-flightlog": "dist/server.js"
+    "mcp-flightlog": "dist/server.js",
+    "flightlog-sync": "dist/sync-cli.js"
   },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
-    "clean": "rm -rf dist"
+    "clean": "rm -rf dist",
+    "sync": "node dist/sync-cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
     "better-sqlite3": "^11.0.0",
     "dotenv": "^16.4.7",
+    "pg": "^8.13.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
     "typescript": "^5.7.0"
   },
   "author": "Rob Hudson <https://github.com/RobHudson72>",

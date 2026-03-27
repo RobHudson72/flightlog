@@ -14,8 +14,10 @@ import {
   handleDeleteSessions,
   handleIngestStatus,
   handleRebuild,
+  handleSync,
 } from './tools.js';
 import { ingestAll } from './ingest.js';
+import { isSyncConfigured, startBackgroundSync } from './sync.js';
 
 const INGEST_INTERVAL_MS = 5_000;
 
@@ -41,7 +43,7 @@ server.tool(
     exclude_block_types: z.array(z.string()).optional().describe('Exclude block types from results (e.g. ["tool_result", "tool_use"] to focus on reasoning and discussion)'),
     tool_name: z.string().optional().describe('Filter to blocks from a specific tool (e.g. "Read", "Bash", "Edit")'),
     limit: z.number().optional().describe('Max results to return (default 20)'),
-    snippet_length: z.number().optional().describe('Max characters per snippet (default 300). If a result ends with "..." it was truncated — retry with a larger value (e.g. 5000) or use flightlog_get_session to read the full transcript.'),
+    snippet_length: z.number().optional().describe('Max characters per snippet (default 300). If a result ends with "..." it was truncated — use 0 to return full content with no truncation, or a larger value like 5000. Use flightlog_get_session for full transcripts.'),
     include: z.array(z.string()).optional().describe('Array of extra field keys to add to each result. Valid keys: "token_counts" (adds input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens), "version" (Claude Code version string), "uuid" (message ID), "cwd" (working directory). Example: ["token_counts", "version"]. Default results already include session_id, project, timestamp, role, model, git_branch, block_type, tool_name, snippet — use this parameter only when you need fields beyond those.'),
   },
   async (params) => handleSearch(params),
@@ -65,7 +67,7 @@ server.tool(
     limit: z.number().optional().describe('Number of messages to return (default 20)'),
     include_tool_io: z.boolean().optional().describe('Include tool_use inputs and tool_result outputs (default false — excluded to reduce noise)'),
     block_type: z.string().optional().describe('Filter to a specific block type: text, thinking, tool_use, tool_result, or user_text'),
-    snippet_length: z.number().optional().describe('Max characters per message snippet (default 500)'),
+    snippet_length: z.number().optional().describe('Max characters per message snippet (default 500). Use 0 for no truncation.'),
   },
   async (params) => handleTail(params),
 );
@@ -125,6 +127,13 @@ server.tool(
   async () => handleRebuild(),
 );
 
+server.tool(
+  'flightlog_sync',
+  'Manually trigger sync of local conversation data to remote PostgreSQL. Only available when FLIGHTLOG_SYNC_URL is configured. Use for testing or forcing an immediate sync.',
+  {},
+  async () => handleSync(),
+);
+
 // ── Auto-ingest ─────────────────────────────────────────────────
 
 async function tryIngest(): Promise<void> {
@@ -150,3 +159,10 @@ process.stderr.write('flightlog MCP server running\n');
 // Ingest on startup, then periodically.
 tryIngest();
 setInterval(tryIngest, INGEST_INTERVAL_MS);
+
+// Start background sync if configured.
+if (isSyncConfigured()) {
+  const { getDb } = await import('./db.js');
+  startBackgroundSync(getDb());
+  process.stderr.write('flightlog: PostgreSQL sync enabled\n');
+}

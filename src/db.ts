@@ -13,6 +13,8 @@ import type {
   TranscriptMessage,
   TranscriptBlock,
   TailResult,
+  SyncState,
+  SessionRow,
 } from './types.js';
 
 // ── Database connection management ──────────────────────────────
@@ -105,6 +107,13 @@ function ensureSchema(db: Database.Database): void {
       file_size       INTEGER NOT NULL,
       last_modified   TEXT NOT NULL,
       ingested_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS sync_state (
+      key                  TEXT PRIMARY KEY DEFAULT 'pg',
+      last_synced_block_id INTEGER NOT NULL DEFAULT 0,
+      last_sync_at         TEXT,
+      last_sync_error      TEXT
     );
 
     -- Indexes for JOIN performance
@@ -271,10 +280,12 @@ export function searchContentBlocks(
       s.git_branch,
       cb.block_type,
       cb.tool_name,
-      CASE
+      ${(filters.snippet_length ?? 300) === 0
+        ? `cb.text_content AS snippet`
+        : `CASE
         WHEN LENGTH(cb.text_content) > ${filters.snippet_length ?? 300} THEN SUBSTR(cb.text_content, 1, ${filters.snippet_length ?? 300}) || '...'
         ELSE cb.text_content
-      END AS snippet
+      END AS snippet`}
       ${extraCols}
     FROM content_blocks cb
     JOIN messages m ON m.uuid = cb.message_uuid
@@ -439,10 +450,12 @@ export function tailSession(
       s.git_branch,
       cb.block_type,
       cb.tool_name,
-      CASE
+      ${snippetLength === 0
+        ? `cb.text_content AS snippet`
+        : `CASE
         WHEN LENGTH(cb.text_content) > ${snippetLength} THEN SUBSTR(cb.text_content, 1, ${snippetLength}) || '...'
         ELSE cb.text_content
-      END AS snippet
+      END AS snippet`}
     FROM content_blocks cb
     JOIN messages m ON m.uuid = cb.message_uuid
     JOIN sessions s ON s.session_id = m.session_id
@@ -602,6 +615,84 @@ export function getIngestStatus(db: Database.Database): {
   };
 }
 
+// ── Sync helpers ────────────────────────────────────────────────
+
+export function getSyncState(db: Database.Database): SyncState {
+  const row = db.prepare(`SELECT * FROM sync_state WHERE key = 'pg'`).get() as RowData | undefined;
+  if (!row) {
+    return { last_synced_block_id: 0, last_sync_at: null, last_sync_error: null };
+  }
+  return {
+    last_synced_block_id: Number(row['last_synced_block_id']),
+    last_sync_at: row['last_sync_at'] ? String(row['last_sync_at']) : null,
+    last_sync_error: row['last_sync_error'] ? String(row['last_sync_error']) : null,
+  };
+}
+
+export function updateSyncState(
+  db: Database.Database,
+  blockId: number,
+  error?: string | null,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO sync_state (key, last_synced_block_id, last_sync_at, last_sync_error)
+    VALUES ('pg', ?, ?, ?)
+    ON CONFLICT (key) DO UPDATE SET
+      last_synced_block_id = excluded.last_synced_block_id,
+      last_sync_at = excluded.last_sync_at,
+      last_sync_error = excluded.last_sync_error
+  `).run(blockId, now, error ?? null);
+}
+
+export function getUnsyncedData(
+  db: Database.Database,
+  afterBlockId: number,
+  activeOnly: boolean,
+  limit: number,
+): { sessions: SessionRow[]; messages: MessageRow[]; blocks: ContentBlockRow[] } {
+  // Step 1: fetch new content blocks
+  let blockSql = `
+    SELECT cb.*
+    FROM content_blocks cb
+    JOIN messages m ON m.uuid = cb.message_uuid
+  `;
+  const blockParams: unknown[] = [];
+
+  if (activeOnly) {
+    blockSql += `
+      JOIN sessions s ON s.session_id = m.session_id
+      WHERE cb.id > ? AND s.last_message_at >= datetime('now', '-2 hours')
+    `;
+  } else {
+    blockSql += `WHERE cb.id > ?`;
+  }
+  blockParams.push(afterBlockId);
+  blockSql += ` ORDER BY cb.id ASC LIMIT ?`;
+  blockParams.push(limit);
+
+  const blocks = db.prepare(blockSql).all(...blockParams) as unknown as ContentBlockRow[];
+  if (blocks.length === 0) {
+    return { sessions: [], messages: [], blocks: [] };
+  }
+
+  // Step 2: collect distinct message UUIDs and fetch messages
+  const messageUuids = [...new Set(blocks.map(b => b.message_uuid))];
+  const msgPlaceholders = messageUuids.map(() => '?').join(', ');
+  const messages = db.prepare(
+    `SELECT * FROM messages WHERE uuid IN (${msgPlaceholders})`,
+  ).all(...messageUuids) as unknown as MessageRow[];
+
+  // Step 3: collect distinct session IDs and fetch sessions
+  const sessionIds = [...new Set(messages.map(m => m.session_id))];
+  const sessPlaceholders = sessionIds.map(() => '?').join(', ');
+  const sessions = db.prepare(
+    `SELECT * FROM sessions WHERE session_id IN (${sessPlaceholders})`,
+  ).all(...sessionIds) as unknown as SessionRow[];
+
+  return { sessions, messages, blocks };
+}
+
 export function resetDatabase(db: Database.Database): void {
   schemaReady = false;
   db.exec(`
@@ -609,6 +700,7 @@ export function resetDatabase(db: Database.Database): void {
     DROP TABLE IF EXISTS messages;
     DROP TABLE IF EXISTS sessions;
     DROP TABLE IF EXISTS ingest_log;
+    DROP TABLE IF EXISTS sync_state;
   `);
   ensureSchema(db);
   schemaReady = true;
