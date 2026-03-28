@@ -17,6 +17,7 @@ import {
   handleSync,
 } from './tools.js';
 import { ingestAll } from './ingest.js';
+import { startWatcher } from './watcher.js';
 import { isSyncConfigured, startBackgroundSync } from './sync.js';
 
 const INGEST_INTERVAL_MS = 5_000;
@@ -88,7 +89,7 @@ server.tool(
 
 server.tool(
   'flightlog_ingest',
-  'Trigger re-indexing of Claude Code conversation logs. Normally runs automatically every 5 seconds. Use this to force an immediate refresh if you need to search very recent conversations.',
+  'Trigger re-indexing of Claude Code conversation logs. Normally runs automatically in near-realtime via file watching. Use this to force a full re-scan if needed.',
   {
     path: z.string().optional().describe('Specific JSONL file or directory to ingest. Defaults to all of ~/.claude/projects/'),
   },
@@ -115,7 +116,7 @@ server.tool(
 
 server.tool(
   'flightlog_ingest_status',
-  'Check if conversation indexing is in progress and how far along it is.',
+  'Check indexing status: whether the realtime file watcher is active, queue depth of pending files, and ingestion progress.',
   {},
   async () => handleIngestStatus(),
 );
@@ -156,9 +157,17 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 process.stderr.write('flightlog MCP server running\n');
 
-// Ingest on startup, then periodically.
-tryIngest();
-setInterval(tryIngest, INGEST_INTERVAL_MS);
+// Ingest on startup (full scan to catch anything missed while server was down).
+await tryIngest();
+
+// Start file watcher for realtime ingestion; fall back to polling if it fails.
+const watcherStarted = await startWatcher();
+if (watcherStarted) {
+  process.stderr.write('flightlog: file watcher active (realtime ingestion)\n');
+} else {
+  process.stderr.write('flightlog: file watcher failed, falling back to 5s polling\n');
+  setInterval(tryIngest, INGEST_INTERVAL_MS);
+}
 
 // Start background sync if configured.
 if (isSyncConfigured()) {

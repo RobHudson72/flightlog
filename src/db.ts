@@ -58,6 +58,18 @@ export function getDb(): Database.Database {
   return singleton;
 }
 
+/**
+ * Close the singleton database connection and clear the cached reference.
+ * Primarily used in tests to allow re-initialization with a different path.
+ */
+export function closeDb(): void {
+  if (singleton) {
+    singleton.close();
+    singleton = null;
+    schemaReady = false;
+  }
+}
+
 // ── Schema DDL ──────────────────────────────────────────────────
 
 function ensureSchema(db: Database.Database): void {

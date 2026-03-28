@@ -55,12 +55,12 @@ export function discoverJsonlFiles(basePath?: string): string[] {
 
 // ── Incremental filtering ───────────────────────────────────────
 
-interface FileToIngest {
+export interface FileToIngest {
   filePath: string;
   skipLines: number;
 }
 
-function filterChangedFiles(
+export function filterChangedFiles(
   files: string[],
   db: Database.Database,
 ): FileToIngest[] {
@@ -245,7 +245,7 @@ function toMessageRow(line: JsonlLine, sessionId: string): MessageRow | null {
   return null;
 }
 
-async function ingestFile(
+export async function ingestFile(
   filePath: string,
   db: Database.Database,
   skipLines: number,
@@ -322,10 +322,43 @@ const progress: IngestProgress = {
   messages_added: 0,
   current_file: null,
   errors: [],
+  queue_depth: 0,
+  oldest_queued_since: null,
+  queued_paths: [],
+  watcher_active: false,
+  fallback_polling: false,
 };
 
+// Optional hook for watcher to inject queue metrics into progress
+type QueueMetricsProvider = () => {
+  queue_depth: number;
+  oldest_queued_since: string | null;
+  queued_paths: string[];
+  watcher_active: boolean;
+  fallback_polling: boolean;
+};
+
+let queueMetricsProvider: QueueMetricsProvider | null = null;
+
+export function setQueueMetricsProvider(provider: QueueMetricsProvider): void {
+  queueMetricsProvider = provider;
+}
+
 export function getProgress(): IngestProgress {
-  return { ...progress };
+  const base = { ...progress };
+  if (queueMetricsProvider) {
+    const metrics = queueMetricsProvider();
+    base.queue_depth = metrics.queue_depth;
+    base.oldest_queued_since = metrics.oldest_queued_since;
+    base.queued_paths = metrics.queued_paths;
+    base.watcher_active = metrics.watcher_active;
+    base.fallback_polling = metrics.fallback_polling;
+  }
+  return base;
+}
+
+export function isIngestRunning(): boolean {
+  return ingestRunning;
 }
 
 // ── Main ingest orchestrator ────────────────────────────────────
