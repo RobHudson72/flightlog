@@ -207,8 +207,11 @@ export async function handleIngest(params: { path?: string }) {
       });
     }
 
+    const modeMsg = progress.watcher_active
+      ? 'New conversations are ingested in near-realtime via file watching.'
+      : 'New conversations are automatically ingested every 5 seconds.';
     return ok({
-      message: 'All conversation files are already ingested and up to date. New conversations are automatically ingested every 60 seconds.',
+      message: `All conversation files are already ingested and up to date. ${modeMsg}`,
       ...progress,
     });
   } catch (e) {
@@ -261,11 +264,16 @@ export async function handleIngestStatus() {
     const db = getDb();
     const dbStatus = getIngestStatus(db);
 
-    const statusMessage = progress.status === 'running'
-      ? `Ingestion in progress: ${progress.files_ingested}/${progress.total_files} files (${progress.percent_complete}%).${progress.current_file ? ` Currently processing: ${progress.current_file}` : ''}`
-      : progress.status === 'complete'
-        ? `Ingestion complete. ${dbStatus.files_tracked} files tracked, ${dbStatus.total_lines_ingested} total lines ingested.`
-        : `Idle. ${dbStatus.files_tracked} files tracked. Auto-ingest runs every 60 seconds.`;
+    let statusMessage: string;
+    if (progress.status === 'running') {
+      statusMessage = `Ingestion in progress: ${progress.files_ingested}/${progress.total_files} files (${progress.percent_complete}%).${progress.current_file ? ` Currently processing: ${progress.current_file}` : ''}`;
+    } else if (progress.queue_depth > 0) {
+      statusMessage = `${progress.queue_depth} file(s) queued for ingestion.${progress.oldest_queued_since ? ` Oldest pending since: ${progress.oldest_queued_since}` : ''}`;
+    } else if (progress.watcher_active) {
+      statusMessage = `Idle. Watching for changes in realtime. ${dbStatus.files_tracked} files tracked, ${dbStatus.total_lines_ingested} total lines ingested.`;
+    } else {
+      statusMessage = `Idle. ${dbStatus.files_tracked} files tracked, ${dbStatus.total_lines_ingested} total lines ingested. Polling every 5s (file watcher unavailable).`;
+    }
 
     return ok({
       message: statusMessage,

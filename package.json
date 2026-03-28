@@ -12,12 +12,14 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
     "clean": "rm -rf dist",
     "sync": "node dist/sync-cli.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
     "better-sqlite3": "^11.0.0",
+    "chokidar": "^4.0.0",
     "dotenv": "^16.4.7",
     "pg": "^8.13.0",
     "zod": "^3.23.0"
@@ -26,7 +28,8 @@
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^22.0.0",
     "@types/pg": "^8.11.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.2"
   },
   "author": "Rob Hudson <https://github.com/RobHudson72>",
   "repository": {

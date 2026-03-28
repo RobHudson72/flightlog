@@ -210,6 +210,12 @@ export interface IngestProgress {
   messages_added: number;
   current_file: string | null;
   errors: string[];
+  // Queue depth fields for realtime watcher
+  queue_depth: number;
+  oldest_queued_since: string | null;
+  queued_paths: string[];
+  watcher_active: boolean;
+  fallback_polling: boolean;
 }
 
 export interface TailResult {
