@@ -57,7 +57,7 @@ Add to your Claude Code MCP config (`.mcp.json` in your project root or `~/.clau
 }
 ```
 
-Restart Claude Code. Flightlog automatically discovers and ingests your conversation logs on startup and every 5 seconds thereafter.
+Restart Claude Code. Flightlog automatically discovers and ingests your conversation logs on startup, then watches for changes in realtime via file system events.
 
 ## Tools
 
@@ -67,8 +67,8 @@ Restart Claude Code. Flightlog automatically discovers and ingests your conversa
 | `flightlog_get_session` | Retrieve the full transcript of a session, optionally including tool inputs/outputs |
 | `flightlog_tail` | Get the last N messages from a session, most recent first — the "what is this agent doing right now?" query |
 | `flightlog_list_sessions` | Browse sessions with metadata, git branch, and a preview of the first message |
-| `flightlog_ingest` | Trigger ingestion manually — processes most recent conversations first, runs in background |
-| `flightlog_ingest_status` | Check ingestion progress: files processed, percent complete, current file |
+| `flightlog_ingest` | Trigger a full re-scan manually — processes most recent conversations first, runs in background |
+| `flightlog_ingest_status` | Check ingestion status: watcher state, queue depth of pending files, and ingestion progress |
 | `flightlog_stats` | Database statistics: session count, messages, disk size, compression ratio |
 | `flightlog_delete_sessions` | Remove sessions by ID, date, or project |
 | `flightlog_rebuild` | Drop and recreate the database from scratch |
@@ -107,17 +107,18 @@ limit           — max results (default 20)
 
 ## How It Works
 
-1. **Discovery** — Scans `~/.claude/projects/**/*.jsonl` for conversation files
-2. **Incremental ingest** — Tracks file sizes to only process new/changed files, skipping already-ingested lines (append-only optimization)
-3. **Decomposition** — Splits messages into searchable content blocks: user text, assistant text, thinking, tool calls, and tool results
-4. **Storage** — SQLite with WAL mode. Indexed on join columns, timestamps, block types, and tool names
-5. **Search** — `LIKE` pattern matching with ~28ms query times at 80K+ content blocks
+1. **Discovery** — Scans `~/.claude/projects/**/*.jsonl` for conversation files on startup
+2. **Realtime watching** — Uses [chokidar](https://github.com/paulmillr/chokidar) to watch for file changes, with per-file debounce (30ms) and a sequential drain queue. Falls back to 5-second polling if file watching is unavailable.
+3. **Incremental ingest** — Tracks file sizes to only process new/changed files, skipping already-ingested lines (append-only optimization)
+4. **Decomposition** — Splits messages into searchable content blocks: user text, assistant text, thinking, tool calls, and tool results
+5. **Storage** — SQLite with WAL mode. Indexed on join columns, timestamps, block types, and tool names
+6. **Search** — `LIKE` pattern matching with ~28ms query times at 80K+ content blocks
 
 ### Multi-Agent Support
 
 Flightlog handles concurrent access from multiple Claude Code instances out of the box. SQLite's WAL (Write-Ahead Logging) mode supports concurrent readers with one writer — no file locking issues, no configuration needed. Works on macOS, Linux, and Windows.
 
-Each agent's MCP server instance shares the same database. Auto-ingest runs every 5 seconds, so one agent can search another agent's recent conversation within seconds.
+Each agent's MCP server instance shares the same database. Realtime file watching means one agent can search another agent's recent conversation within milliseconds of it being written.
 
 ## What's Searchable
 
@@ -134,8 +135,9 @@ Each agent's MCP server instance shares the same database. Auto-ingest runs ever
 | Metric | Value |
 |--------|-------|
 | Query time | ~28ms (server-side, reported in `query_ms` field) |
-| Ingest interval | 5 seconds |
-| Idle ingest cost | ~10-20ms (readdir + stat, no DB writes if nothing changed) |
+| Ingest latency (p50) | ~48ms write-to-searchable |
+| Ingest latency (p90) | ~63ms write-to-searchable |
+| Ingest throughput | ~1,400 msgs/sec (single file), ~1,400 msgs/sec (20 concurrent files) |
 | DB size | ~5x smaller than raw JSONL |
 
 ## Configuration
