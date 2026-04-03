@@ -85,12 +85,12 @@ async function ensurePgSchema(p: PgPool): Promise<void> {
       block_type        TEXT NOT NULL,
       text_content      TEXT,
       tool_name         TEXT,
-      tool_input        TEXT
+      tool_input        TEXT,
+      UNIQUE (message_uuid, block_index)
     );
 
     CREATE INDEX IF NOT EXISTS idx_pg_messages_session_id ON messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_pg_messages_timestamp ON messages(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_pg_content_blocks_message_uuid ON content_blocks(message_uuid);
     CREATE INDEX IF NOT EXISTS idx_pg_content_blocks_block_type ON content_blocks(block_type);
     CREATE INDEX IF NOT EXISTS idx_pg_sessions_started_at ON sessions(started_at);
   `);
@@ -135,7 +135,7 @@ async function insertBlocks(client: { query: PgPool['query'] }, blocks: ContentB
     await client.query(
       `INSERT INTO content_blocks (id, message_uuid, block_index, block_type, text_content, tool_name, tool_input)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (id) DO NOTHING`,
+       ON CONFLICT (message_uuid, block_index) DO NOTHING`,
       [b.id, b.message_uuid, b.block_index, b.block_type, b.text_content, b.tool_name, b.tool_input],
     );
   }

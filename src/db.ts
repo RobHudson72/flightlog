@@ -128,11 +128,14 @@ function ensureSchema(db: Database.Database): void {
       last_sync_error      TEXT
     );
 
+    -- Prevent duplicate content blocks on re-ingestion
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_content_blocks_identity
+      ON content_blocks(message_uuid, block_index);
+
     -- Indexes for JOIN performance
     CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
     CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
     CREATE INDEX IF NOT EXISTS idx_messages_role ON messages(role);
-    CREATE INDEX IF NOT EXISTS idx_content_blocks_message_uuid ON content_blocks(message_uuid);
     CREATE INDEX IF NOT EXISTS idx_content_blocks_block_type ON content_blocks(block_type);
     CREATE INDEX IF NOT EXISTS idx_content_blocks_tool_name ON content_blocks(tool_name);
     CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
@@ -179,7 +182,7 @@ export function insertMessage(db: Database.Database, row: MessageRow): void {
 
 export function insertContentBlock(db: Database.Database, block: ContentBlockRow): void {
   db.prepare(`
-    INSERT INTO content_blocks (message_uuid, block_index, block_type, text_content, tool_name, tool_input)
+    INSERT OR IGNORE INTO content_blocks (message_uuid, block_index, block_type, text_content, tool_name, tool_input)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(block.message_uuid, block.block_index, block.block_type,
     block.text_content, block.tool_name, block.tool_input);
