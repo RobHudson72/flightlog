@@ -2,3 +2,10 @@ node_modules/
 dist/
 *.db
 .env
+
+# The database's sidecar files. The db itself lives in E:\data\fermi\flightlog
+# (FLIGHTLOG_DB_PATH in the consuming .mcp.json) and is never in this repo, but
+# these patterns keep a stray local copy's WAL out too.
+*.db-shm
+*.db-wal
+*.db.wal
