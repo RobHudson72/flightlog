@@ -10,6 +10,12 @@ import { ingestFile, filterChangedFiles, isIngestRunning, setQueueMetricsProvide
 const DEBOUNCE_MS = 30;
 const DRAIN_RETRY_MS = 200;
 const DRAIN_MAX_RETRIES = 50; // 50 × 200ms = 10s max wait for ingest lock
+// chokidar stats every entry it scans before 'ready'. On a fleet box the
+// projects tree holds ~550 project dirs / ~7k transcripts (and ~57k files in
+// session subtrees that discovery never reads), so a scoped scan still takes
+// ~8 s under Defender; the old 10 s ceiling made every server time out and
+// silently run the 5 s full-tree polling fallback forever (~0.2 core each).
+const READY_TIMEOUT_MS = 90_000;
 
 function getClaudeProjectsDir(): string {
   return path.join(os.homedir(), '.claude', 'projects');
@@ -177,19 +183,30 @@ export async function startWatcher(watchPath?: string): Promise<boolean> {
     }
   }
 
+  const isRelevant = (filePath: string): boolean => {
+    const base = path.basename(filePath);
+    return base.endsWith('.jsonl') && base !== 'history.jsonl';
+  };
+
   try {
     // Watch the directory, not a glob — chokidar globs miss dynamically-created
-    // subdirectories on some platforms (notably Windows).
+    // subdirectories on some platforms (notably Windows). Scope the scan to what
+    // discoverJsonlFiles reads: <projects>/<project>/*.jsonl. Session subtrees
+    // (subagent transcripts, tool outputs) are ignored so the initial scan and
+    // the handle count stay proportional to the number of projects.
+    const watchStart = performance.now();
     watcher = chokidar.watch(projectsDir, {
       ignoreInitial: true,
       persistent: true,
       awaitWriteFinish: false,
+      depth: 1,
+      ignored: (entryPath: string, stats?: fs.Stats): boolean => {
+        if (!stats) return false;
+        const rel = path.relative(projectsDir, entryPath);
+        if (stats.isDirectory()) return rel !== '' && rel.includes(path.sep);
+        return !isRelevant(entryPath);
+      },
     });
-
-    const isRelevant = (filePath: string): boolean => {
-      const base = path.basename(filePath);
-      return base.endsWith('.jsonl') && base !== 'history.jsonl';
-    };
 
     watcher.on('add', (filePath: string) => {
       if (isRelevant(filePath)) enqueueFile(filePath);
@@ -206,7 +223,10 @@ export async function startWatcher(watchPath?: string): Promise<boolean> {
 
     // Wait for the watcher to be ready, with a timeout
     await new Promise<void>((resolve, reject) => {
-      const timeoutId = setTimeout(() => reject(new Error('Watcher initialization timed out')), 10_000);
+      const timeoutId = setTimeout(
+        () => reject(new Error(`Watcher initialization timed out after ${READY_TIMEOUT_MS} ms`)),
+        READY_TIMEOUT_MS,
+      );
       watcher!.on('ready', () => {
         clearTimeout(timeoutId);
         resolve();
@@ -214,7 +234,9 @@ export async function startWatcher(watchPath?: string): Promise<boolean> {
     });
 
     watcherActive = true;
-    process.stderr.write(`flightlog: watching ${projectsDir}\n`);
+    process.stderr.write(
+      `flightlog: watching ${projectsDir} (ready in ${Math.round(performance.now() - watchStart)} ms)\n`,
+    );
     return true;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

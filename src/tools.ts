@@ -278,7 +278,9 @@ export async function handleIngestStatus() {
     return ok({
       message: statusMessage,
       progress,
-      database: dbStatus,
+      // The per-file list is thousands of rows on a fleet box (a 2 MB tool
+      // result); keep the aggregates and only the most recently ingested files.
+      database: { ...dbStatus, files: dbStatus.files.slice(0, 25), files_listed: Math.min(25, dbStatus.files.length) },
     });
   } catch (e) {
     return errFromCatch('flightlog_ingest_status', e);
