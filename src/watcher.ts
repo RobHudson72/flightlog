@@ -132,15 +132,14 @@ async function drain(): Promise<void> {
 
         const db = getDb();
 
-        // Determine how many lines to skip (incremental)
-        const changed = filterChangedFiles([filePath], db);
+        // Determine the byte offset to tail from (incremental)
+        const changed = await filterChangedFiles([filePath], db);
         if (changed.length === 0) {
           // File exists but has no new content — this is normal for duplicate events
           continue;
         }
 
-        const { skipLines } = changed[0];
-        const result = await ingestFile(filePath, db, skipLines);
+        const result = await ingestFile(filePath, db, changed[0]!.start);
 
         if (result.messagesAdded > 0) {
           process.stderr.write(

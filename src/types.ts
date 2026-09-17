@@ -124,6 +124,14 @@ export interface IngestLogRow {
   ingested_at: string;
 }
 
+/** Tail-ingest position: `byte_offset` is always just past a consumed `\n`. */
+export interface IngestOffsetRow {
+  file_path: string;
+  byte_offset: number;
+  lines_consumed: number;
+  updated_at: string;
+}
+
 // ── Tool return types ───────────────────────────────────────────
 
 export interface SearchResult {

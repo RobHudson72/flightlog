@@ -109,7 +109,7 @@ limit           — max results (default 20)
 
 1. **Discovery** — Scans `~/.claude/projects/**/*.jsonl` for conversation files on startup
 2. **Realtime watching** — Uses [chokidar](https://github.com/paulmillr/chokidar) to watch for file changes, with per-file debounce (30ms) and a sequential drain queue. Falls back to 5-second polling if file watching is unavailable.
-3. **Incremental ingest** — Tracks file sizes to only process new/changed files, skipping already-ingested lines (append-only optimization)
+3. **Incremental ingest** — Tails a changed file from the byte just past the last newline it consumed (`ingest_offsets`), so an append costs a stat + a seek + parsing the new bytes, never a re-read of the whole transcript. Only newline-terminated lines are consumed (a write in progress waits for the next event); a file that shrinks is re-read from byte 0, and rows are deduplicated by their unique constraints. A position recorded by an older version (`ingest_log.file_size`) is bootstrapped once by backing up two complete lines and re-reading from there (that size could include a line the old code never parsed); `flightlog_rebuild` remains the way to re-read everything.
 4. **Decomposition** — Splits messages into searchable content blocks: user text, assistant text, thinking, tool calls, and tool results
 5. **Storage** — SQLite with WAL mode. Indexed on join columns, timestamps, block types, and tool names
 6. **Search** — `LIKE` pattern matching with ~28ms query times at 80K+ content blocks

@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import readline from 'node:readline';
 import type Database from 'better-sqlite3';
 import type {
   JsonlLine,
@@ -16,10 +15,13 @@ import type {
 import {
   getDb,
   getIngestLog,
+  getIngestOffset,
   insertMessage,
   insertContentBlock,
+  refreshSessionMessageCount,
   upsertSession,
   upsertIngestLog,
+  upsertIngestOffset,
 } from './db.js';
 
 // ── File discovery ──────────────────────────────────────────────
@@ -54,33 +56,153 @@ export function discoverJsonlFiles(basePath?: string): string[] {
 }
 
 // ── Incremental filtering ───────────────────────────────────────
+//
+// Transcripts are append-only JSONL, so a changed file is tailed from the byte
+// just past the last newline we consumed (`ingest_offsets.byte_offset`) rather
+// than re-streamed from byte 0 and line-skipped. `start.offset === 0` means a
+// full read. Offsets are BYTES, never string lengths (multibyte + CRLF safe).
+
+export interface IngestStart {
+  /** Byte offset to begin reading at; always just past a consumed `\n`, or 0. */
+  offset: number;
+  /** Lines consumed before `offset` (carried into the running total). */
+  lines: number;
+}
 
 export interface FileToIngest {
   filePath: string;
-  skipLines: number;
+  start: IngestStart;
 }
 
-export function filterChangedFiles(
+const FULL_READ: IngestStart = { offset: 0, lines: 0 };
+
+/** How many complete lines before a legacy position are re-read on bootstrap. */
+const LEGACY_BACKUP_LINES = 2;
+/** Largest tail window scanned for those lines; a longer last line → full read. */
+const LEGACY_TAIL_WINDOW = 1024 * 1024;
+
+/**
+ * Picks a safe resume point for a file whose only recorded position is a
+ * legacy `ingest_log` row. The old code took `file_size` from a stat() AFTER
+ * its read loop, so that value can include a line it never parsed (appended
+ * between EOF and stat) or a half-written line that `readline` counted and
+ * `JSON.parse` rejected — and an older server still running on this DB keeps
+ * writing such values. Rather than trust the position, back up to the start of
+ * the last `LEGACY_BACKUP_LINES` complete lines before it and re-read them;
+ * duplicates are absorbed by the unique constraints. Returns null (→ full
+ * read) when the position is mid-line, the tail window holds no newline, or
+ * the file is smaller than the recorded size. Older losses further back in a
+ * file are not recoverable from here; `flightlog_rebuild` re-reads everything.
+ */
+async function legacyResumePoint(filePath: string, legacySize: number, fileSize: number): Promise<number | null> {
+  const end = Math.min(legacySize, fileSize);
+  if (end <= 0 || fileSize < legacySize) return null;
+  const windowStart = Math.max(0, end - LEGACY_TAIL_WINDOW);
+
+  const chunks: Buffer[] = [];
+  const stream = fs.createReadStream(filePath, { start: windowStart, end: end - 1 });
+  for await (const chunk of stream as AsyncIterable<Buffer>) chunks.push(chunk);
+  const tail = Buffer.concat(chunks);
+  if (tail.length === 0 || tail[tail.length - 1] !== 0x0a) return null; // mid-line
+
+  // Walk back over LEGACY_BACKUP_LINES newlines beyond the terminating one.
+  let pos = tail.length - 1;
+  for (let i = 0; i < LEGACY_BACKUP_LINES; i++) {
+    const prev = tail.lastIndexOf(0x0a, pos - 1);
+    if (prev === -1) return windowStart === 0 ? 0 : null;
+    pos = prev;
+  }
+  return windowStart + pos + 1;
+}
+
+/**
+ * Decides where to start reading `filePath`, or null when nothing new exists.
+ * Order of trust: `ingest_offsets` (written only by offset-aware code) → a
+ * legacy `ingest_log` row, backed up by a couple of lines → full read. The
+ * legacy branch never short-circuits on "same size": the old server's size
+ * can cover a line it never read, so the bootstrap runs once per file.
+ */
+export async function resolveStart(
+  db: Database.Database,
+  filePath: string,
+  fileSize: number,
+): Promise<IngestStart | null> {
+  const known = getIngestOffset(db, filePath);
+  if (known) {
+    if (fileSize === known.byte_offset) return null;
+    if (fileSize < known.byte_offset) {
+      process.stderr.write(
+        `flightlog: ${path.basename(filePath)} shrank below its stored offset, re-reading from 0\n`,
+      );
+      return FULL_READ;
+    }
+    return { offset: known.byte_offset, lines: known.lines_consumed };
+  }
+
+  const legacy = getIngestLog(db, filePath);
+  if (!legacy) return FULL_READ;
+
+  const resume = await legacyResumePoint(filePath, legacy.file_size, fileSize);
+  if (resume === null) {
+    process.stderr.write(
+      `flightlog: stored position for ${path.basename(filePath)} is not usable, re-reading from 0\n`,
+    );
+    return FULL_READ;
+  }
+  return { offset: resume, lines: Math.max(0, legacy.lines_ingested - LEGACY_BACKUP_LINES) };
+}
+
+export async function filterChangedFiles(
   files: string[],
   db: Database.Database,
-): FileToIngest[] {
+): Promise<FileToIngest[]> {
   const toIngest: FileToIngest[] = [];
 
   for (const filePath of files) {
     const stat = fs.statSync(filePath);
-    const existing = getIngestLog(db, filePath);
-
-    if (!existing) {
-      // New file — ingest from the start
-      toIngest.push({ filePath, skipLines: 0 });
-    } else if (stat.size > existing.file_size) {
-      // File grew — append-only optimization: skip already-ingested lines
-      toIngest.push({ filePath, skipLines: existing.lines_ingested });
-    }
-    // If same size or smaller, skip entirely
+    const start = await resolveStart(db, filePath, stat.size);
+    if (start) toIngest.push({ filePath, start });
   }
 
   return toIngest;
+}
+
+// ── Byte-level line reader ──────────────────────────────────────
+
+interface CompleteLine {
+  text: string;
+  /** Byte offset just past this line's terminating `\n`. */
+  endOffset: number;
+}
+
+/**
+ * Yields only `\n`-terminated lines from `start`, with exact byte positions.
+ * Bytes after the last newline (a write in progress) are never yielded, so the
+ * caller's recorded offset is always a line boundary. A trailing `\r` is
+ * stripped so CRLF files parse; the offset still counts it.
+ */
+async function* readCompleteLines(filePath: string, start: number): AsyncGenerator<CompleteLine> {
+  const stream = fs.createReadStream(filePath, { start });
+  const pending: Buffer[] = [];
+  let chunkStart = start;
+
+  for await (const chunk of stream as AsyncIterable<Buffer>) {
+    let from = 0;
+    let idx = chunk.indexOf(0x0a, from);
+    while (idx !== -1) {
+      const piece = chunk.subarray(from, idx);
+      let lineBuf = pending.length > 0 ? Buffer.concat([...pending, piece]) : piece;
+      pending.length = 0;
+      if (lineBuf.length > 0 && lineBuf[lineBuf.length - 1] === 0x0d) {
+        lineBuf = lineBuf.subarray(0, lineBuf.length - 1);
+      }
+      yield { text: lineBuf.toString('utf8'), endOffset: chunkStart + idx + 1 };
+      from = idx + 1;
+      idx = chunk.indexOf(0x0a, from);
+    }
+    if (from < chunk.length) pending.push(chunk.subarray(from));
+    chunkStart += chunk.length;
+  }
 }
 
 // ── Content block extraction ────────────────────────────────────
@@ -245,30 +367,57 @@ function toMessageRow(line: JsonlLine, sessionId: string): MessageRow | null {
   return null;
 }
 
+const MALFORMED_LOG_LIMIT = 3;
+
+export interface IngestFileResult {
+  /** Message rows actually inserted (duplicates on re-read count 0). */
+  messagesAdded: number;
+  blocksAdded: number;
+  /** Complete lines that failed to parse — a corruption signal, not noise. */
+  malformedLines: number;
+}
+
+/**
+ * Ingests `filePath` from `start.offset` (0 = whole file). Only complete lines
+ * are consumed; the recorded offset is the byte just past the last `\n` read.
+ * Every statement here is idempotent so a crash mid-file (offset not yet
+ * advanced → the lines are re-read) cannot leave a message without its
+ * session row or content blocks: session upsert and block inserts run on
+ * every pass, and only `messagesAdded` depends on whether the insert was new.
+ * `sessions.message_count` is derived from `messages` at the end of a pass.
+ */
 export async function ingestFile(
   filePath: string,
   db: Database.Database,
-  skipLines: number,
-): Promise<{ messagesAdded: number; blocksAdded: number }> {
+  start: IngestStart = FULL_READ,
+): Promise<IngestFileResult> {
   const sessionId = path.basename(filePath, '.jsonl');
   let project: string | null = null;
-  let lineNumber = 0;
+  let linesConsumed = start.lines;
+  let consumedOffset = start.offset;
   let messagesAdded = 0;
   let blocksAdded = 0;
+  let malformedLines = 0;
+  let sessionTouched = false;
 
-  const fileStream = fs.createReadStream(filePath, { encoding: 'utf-8' });
-  const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
-  for await (const rawLine of rl) {
-    lineNumber++;
-    if (lineNumber <= skipLines) continue;
+  for await (const { text: rawLine, endOffset } of readCompleteLines(filePath, start.offset)) {
+    linesConsumed++;
+    consumedOffset = endOffset;
     if (!rawLine.trim()) continue;
 
     let parsed: JsonlLine;
     try {
       parsed = JSON.parse(rawLine) as JsonlLine;
     } catch {
-      continue; // skip malformed lines
+      // The line is newline-terminated, so this is real corruption. Surface it
+      // (the offset still advances: re-reading garbage would never succeed).
+      malformedLines++;
+      if (malformedLines <= MALFORMED_LOG_LIMIT) {
+        process.stderr.write(
+          `flightlog: skipping malformed line ending at byte ${endOffset} in ${path.basename(filePath)}\n`,
+        );
+      }
+      continue;
     }
 
     // Extract project from first message with cwd
@@ -279,10 +428,14 @@ export async function ingestFile(
     const messageRow = toMessageRow(parsed, sessionId);
     if (!messageRow) continue;
 
+    // Duplicates (a re-read, or another server that got here first) are
+    // ignored by the uuid primary key; only the added-count depends on it.
+    if (insertMessage(db, messageRow)) messagesAdded++;
+
     // Use the project we extracted, or fall back to session id
     const sessionProject = project ?? sessionId;
 
-    // Upsert session with each message (updates last_message_at, increments count)
+    // Upsert session on every pass (creates the row, advances last_message_at)
     upsertSession(
       db,
       sessionId,
@@ -292,11 +445,9 @@ export async function ingestFile(
       messageRow.cwd,
       'version' in parsed ? (parsed.version ?? null) : null,
     );
+    sessionTouched = true;
 
-    insertMessage(db, messageRow);
-    messagesAdded++;
-
-    // Extract and insert content blocks
+    // Extract and insert content blocks (idempotent via the identity index)
     const blocks = extractContentBlocks(parsed);
     for (const block of blocks) {
       insertContentBlock(db, block);
@@ -304,11 +455,22 @@ export async function ingestFile(
     }
   }
 
-  // Update ingest log
-  const stat = fs.statSync(filePath);
-  upsertIngestLog(db, filePath, lineNumber, stat.size, stat.mtime);
+  if (sessionTouched) refreshSessionMessageCount(db, sessionId);
 
-  return { messagesAdded, blocksAdded };
+  // Record the position first: `ingest_offsets` is the seek truth. `ingest_log`
+  // is kept coherent for status/stats and for any older server sharing the DB;
+  // its mtime column is informational, so a stat failure (file rotated away)
+  // must not discard the offset just computed.
+  upsertIngestOffset(db, filePath, consumedOffset, linesConsumed);
+  try {
+    const stat = fs.statSync(filePath);
+    upsertIngestLog(db, filePath, linesConsumed, consumedOffset, stat.mtime);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`flightlog: ingest_log not updated for ${path.basename(filePath)}: ${msg}\n`);
+  }
+
+  return { messagesAdded, blocksAdded, malformedLines };
 }
 
 // ── Progress tracking ───────────────────────────────────────────
@@ -422,7 +584,7 @@ async function ingestAllInner(ingestPath?: string): Promise<IngestSummary> {
     }
 
     // Filter to only changed files
-    const toIngest = filterChangedFiles(files, db);
+    const toIngest = await filterChangedFiles(files, db);
 
     // Sort by mtime descending — most recent conversations first
     toIngest.sort((a, b) => {
@@ -447,14 +609,20 @@ async function ingestAllInner(ingestPath?: string): Promise<IngestSummary> {
       errors: [],
     };
 
-    for (const { filePath, skipLines } of toIngest) {
+    for (const { filePath, start } of toIngest) {
       progress.current_file = path.basename(filePath, '.jsonl');
 
       try {
-        const result = await ingestFile(filePath, db, skipLines);
+        const result = await ingestFile(filePath, db, start);
         summary.files_processed++;
         summary.messages_added += result.messagesAdded;
         summary.content_blocks_added += result.blocksAdded;
+        progress.messages_added += result.messagesAdded;
+        if (result.malformedLines > 0) {
+          const note = `${path.basename(filePath)}: ${result.malformedLines} malformed line(s) skipped`;
+          summary.errors.push(note);
+          progress.errors.push(note);
+        }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         summary.errors.push(`${filePath}: ${msg}`);
@@ -464,7 +632,6 @@ async function ingestAllInner(ingestPath?: string): Promise<IngestSummary> {
       // Update progress after each file
       progress.files_ingested++;
       progress.files_remaining--;
-      progress.messages_added += summary.messages_added;
       progress.percent_complete = progress.total_files > 0
         ? Math.round((progress.files_ingested / progress.total_files) * 100)
         : 100;

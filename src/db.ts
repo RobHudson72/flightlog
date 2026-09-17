@@ -10,6 +10,7 @@ import type {
   MessageRow,
   ContentBlockRow,
   IngestLogRow,
+  IngestOffsetRow,
   TranscriptMessage,
   TranscriptBlock,
   TailResult,
@@ -53,6 +54,17 @@ export function getDb(): Database.Database {
   if (!schemaReady) {
     ensureSchema(singleton);
     schemaReady = true;
+    // One-shot repair of counters inflated by older code. Best-effort: a busy
+    // DB (13 servers starting at once) must not take this process's startup
+    // ingest down with it — the marker stays unset, so a later start does it.
+    try {
+      if (recomputeMessageCountsOnce(singleton)) {
+        process.stderr.write('flightlog: recomputed sessions.message_count from messages (one-time repair)\n');
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`flightlog: message_count repair deferred (${msg}); a later start will retry\n`);
+    }
   }
 
   return singleton;
@@ -128,6 +140,23 @@ function ensureSchema(db: Database.Database): void {
       last_sync_error      TEXT
     );
 
+    -- Byte offsets for tail ingestion. Written ONLY by offset-aware code; the
+    -- legacy ingest_log.file_size column is a stat() size that an older server
+    -- may overwrite with a mid-line value, so it is never trusted as a seek
+    -- offset (see ingest.ts resolveStart).
+    CREATE TABLE IF NOT EXISTS ingest_offsets (
+      file_path       TEXT PRIMARY KEY,
+      byte_offset     INTEGER NOT NULL,
+      lines_consumed  INTEGER NOT NULL,
+      updated_at      TEXT NOT NULL
+    );
+
+    -- One-shot maintenance markers (e.g. the message_count recompute).
+    CREATE TABLE IF NOT EXISTS meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
     -- Prevent duplicate content blocks on re-ingestion
     CREATE UNIQUE INDEX IF NOT EXISTS idx_content_blocks_identity
       ON content_blocks(message_uuid, block_index);
@@ -160,14 +189,32 @@ export function upsertSession(
     ON CONFLICT (session_id) DO UPDATE SET
       last_message_at = CASE WHEN excluded.last_message_at > sessions.last_message_at
                              THEN excluded.last_message_at ELSE sessions.last_message_at END,
-      message_count = sessions.message_count + 1,
       git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
       version = COALESCE(excluded.version, sessions.version)
   `).run(sessionId, project, timestamp, timestamp, gitBranch, cwd, version);
 }
 
-export function insertMessage(db: Database.Database, row: MessageRow): void {
+/**
+ * Sets `sessions.message_count` to the true number of message rows. Called at
+ * the end of every ingest pass instead of incrementing per line, so a re-read
+ * (or several servers ingesting the same file) can never inflate it.
+ */
+export function refreshSessionMessageCount(db: Database.Database, sessionId: string): void {
   db.prepare(`
+    UPDATE sessions
+    SET message_count = (SELECT COUNT(*) FROM messages m WHERE m.session_id = sessions.session_id)
+    WHERE session_id = ?
+  `).run(sessionId);
+}
+
+/**
+ * Inserts a message row. Returns true only when a row was actually written;
+ * false when the uuid already existed (INSERT OR IGNORE). Callers must gate
+ * `upsertSession` on the return value — it increments `message_count`, and
+ * counting an ignored insert is how the counter used to inflate on re-ingest.
+ */
+export function insertMessage(db: Database.Database, row: MessageRow): boolean {
+  const result = db.prepare(`
     INSERT OR IGNORE INTO messages (uuid, session_id, parent_uuid, type, role, timestamp, model,
       git_branch, cwd, request_id, is_sidechain, input_tokens, output_tokens,
       cache_read_tokens, cache_creation_tokens)
@@ -178,6 +225,7 @@ export function insertMessage(db: Database.Database, row: MessageRow): void {
     row.input_tokens, row.output_tokens, row.cache_read_tokens,
     row.cache_creation_tokens,
   );
+  return result.changes > 0;
 }
 
 export function insertContentBlock(db: Database.Database, block: ContentBlockRow): void {
@@ -205,6 +253,53 @@ export function upsertIngestLog(
       last_modified = excluded.last_modified,
       ingested_at = excluded.ingested_at
   `).run(filePath, linesIngested, fileSize, lastModified.toISOString(), now);
+}
+
+export function getIngestOffset(db: Database.Database, filePath: string): IngestOffsetRow | null {
+  const row = db.prepare(`SELECT * FROM ingest_offsets WHERE file_path = ?`).get(filePath) as IngestOffsetRow | undefined;
+  return row ?? null;
+}
+
+export function upsertIngestOffset(
+  db: Database.Database,
+  filePath: string,
+  byteOffset: number,
+  linesConsumed: number,
+): void {
+  db.prepare(`
+    INSERT INTO ingest_offsets (file_path, byte_offset, lines_consumed, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT (file_path) DO UPDATE SET
+      byte_offset = excluded.byte_offset,
+      lines_consumed = excluded.lines_consumed,
+      updated_at = excluded.updated_at
+  `).run(filePath, byteOffset, linesConsumed, new Date().toISOString());
+}
+
+const MESSAGE_COUNT_RECOMPUTED_KEY = 'message_count_recomputed';
+
+/**
+ * One-shot repair of `sessions.message_count`, which older code incremented on
+ * every ingested line even when the message insert was ignored as a duplicate
+ * (so N redundant servers inflated it ~N×). Runs inside an IMMEDIATE transaction
+ * keyed on a `meta` row, so concurrent server startups perform it exactly once.
+ * Returns true when this call did the recompute.
+ */
+export function recomputeMessageCountsOnce(db: Database.Database): boolean {
+  const run = db.transaction((): boolean => {
+    const marker = db.prepare(`SELECT value FROM meta WHERE key = ?`).get(MESSAGE_COUNT_RECOMPUTED_KEY);
+    if (marker) return false;
+    db.prepare(`
+      UPDATE sessions
+      SET message_count = (SELECT COUNT(*) FROM messages m WHERE m.session_id = sessions.session_id)
+    `).run();
+    db.prepare(`INSERT INTO meta (key, value) VALUES (?, ?)`).run(
+      MESSAGE_COUNT_RECOMPUTED_KEY,
+      new Date().toISOString(),
+    );
+    return true;
+  });
+  return run.immediate();
 }
 
 // ── Query helpers ───────────────────────────────────────────────
@@ -588,6 +683,7 @@ export function deleteSessions(
 
   for (const id of ids) {
     db.prepare(`DELETE FROM ingest_log WHERE file_path LIKE ?`).run(`%${id}%`);
+    db.prepare(`DELETE FROM ingest_offsets WHERE file_path LIKE ?`).run(`%${id}%`);
   }
 
   return {
@@ -715,7 +811,9 @@ export function resetDatabase(db: Database.Database): void {
     DROP TABLE IF EXISTS messages;
     DROP TABLE IF EXISTS sessions;
     DROP TABLE IF EXISTS ingest_log;
+    DROP TABLE IF EXISTS ingest_offsets;
     DROP TABLE IF EXISTS sync_state;
+    DROP TABLE IF EXISTS meta;
   `);
   ensureSchema(db);
   schemaReady = true;
