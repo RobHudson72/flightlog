@@ -234,6 +234,7 @@ export async function startWatcher(watchPath?: string): Promise<boolean> {
     });
 
     watcherActive = true;
+    fallbackPolling = false; // a recovered watcher clears the fallback flag
     process.stderr.write(
       `flightlog: watching ${projectsDir} (ready in ${Math.round(performance.now() - watchStart)} ms)\n`,
     );
@@ -256,7 +257,65 @@ export async function startWatcher(watchPath?: string): Promise<boolean> {
   }
 }
 
+// ── Retry after a failed start ─────────────────────────────────
+//
+// A mass relaunch (a fleet restart) starts every server's chokidar initial
+// scan at the same instant; under that stampede plus the antivirus scanner the
+// ready scan can exceed any fixed timeout. A server that gives up permanently
+// then polls the full tree every 5 s forever (~0.15 core each) — the exact
+// cost the watcher exists to avoid. So a failed start is retried with jittered
+// backoff; polling covers the gap and stops the moment the watcher is up.
+
+const RETRY_BASE_MS = 60_000;
+const RETRY_MAX_MS = 600_000;
+const RETRY_JITTER_MS = 30_000;
+
+let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Starts the watcher; on failure keeps retrying in the background with
+ * jittered backoff (1 min, 2, 3 … capped at 10 min). `onRecovered` fires once,
+ * the first time a retry succeeds, so the caller can stop its polling loop.
+ * Returns the FIRST attempt's result so callers can decide to poll meanwhile.
+ */
+export async function startWatcherWithRetry(
+  watchPath?: string,
+  onRecovered?: () => void,
+): Promise<boolean> {
+  const ok = await startWatcher(watchPath);
+  if (ok) return true;
+
+  let attempt = 0;
+  const schedule = (): void => {
+    attempt++;
+    const delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * attempt) + Math.random() * RETRY_JITTER_MS;
+    process.stderr.write(`flightlog: watcher retry ${attempt} in ${Math.round(delay / 1000)} s\n`);
+    retryTimer = setTimeout(() => {
+      retryTimer = null;
+      startWatcher(watchPath).then((started) => {
+        if (started) {
+          process.stderr.write(`flightlog: watcher recovered on retry ${attempt}, polling stops\n`);
+          if (onRecovered) onRecovered();
+        } else {
+          schedule();
+        }
+      }).catch((e: unknown) => {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`flightlog: watcher retry error: ${msg}\n`);
+        schedule();
+      });
+    }, delay);
+    if (retryTimer.unref) retryTimer.unref();
+  };
+  schedule();
+  return false;
+}
+
 export async function stopWatcher(): Promise<void> {
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
   // Clear all debounce timers
   for (const timer of debounceMap.values()) {
     clearTimeout(timer);

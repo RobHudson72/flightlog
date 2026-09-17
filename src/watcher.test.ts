@@ -102,3 +102,27 @@ describe('watcher', () => {
     expect(metrics.fallback_polling).toBe(false);
   });
 });
+
+describe('watcher fallback recovery', () => {
+  it('clears fallback_polling when a later start succeeds', async () => {
+    const tmp = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'flightlog-retry-'));
+    process.env['FLIGHTLOG_DB_PATH'] = path.join(tmp, 'test.db');
+    try {
+      // A path with an illegal character cannot be created -> failed start sets the fallback flag
+      const bad = path.join(tmp, 'bad<dir>');
+      expect(await startWatcher(bad)).toBe(false);
+      expect(getQueueMetrics().fallback_polling).toBe(true);
+
+      const good = path.join(tmp, 'projects');
+      fs.mkdirSync(good, { recursive: true });
+      expect(await startWatcher(good)).toBe(true);
+      expect(getQueueMetrics().fallback_polling).toBe(false);
+      expect(getQueueMetrics().watcher_active).toBe(true);
+    } finally {
+      await stopWatcher();
+      closeDb();
+      delete process.env['FLIGHTLOG_DB_PATH'];
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* Windows file locks */ }
+    }
+  });
+});

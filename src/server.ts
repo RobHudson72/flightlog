@@ -17,7 +17,7 @@ import {
   handleSync,
 } from './tools.js';
 import { ingestAll } from './ingest.js';
-import { startWatcher } from './watcher.js';
+import { startWatcherWithRetry } from './watcher.js';
 import { isSyncConfigured, startBackgroundSync } from './sync.js';
 
 const INGEST_INTERVAL_MS = 5_000;
@@ -160,13 +160,21 @@ process.stderr.write('flightlog MCP server running\n');
 // Ingest on startup (full scan to catch anything missed while server was down).
 await tryIngest();
 
-// Start file watcher for realtime ingestion; fall back to polling if it fails.
-const watcherStarted = await startWatcher();
+// Start file watcher for realtime ingestion. If the first attempt fails
+// (a fleet-wide relaunch can push the initial scan past its timeout), poll
+// every 5 s ONLY until a background retry brings the watcher up.
+let pollTimer: ReturnType<typeof setInterval> | null = null;
+const watcherStarted = await startWatcherWithRetry(undefined, () => {
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+});
 if (watcherStarted) {
   process.stderr.write('flightlog: file watcher active (realtime ingestion)\n');
 } else {
-  process.stderr.write('flightlog: file watcher failed, falling back to 5s polling\n');
-  setInterval(tryIngest, INGEST_INTERVAL_MS);
+  process.stderr.write('flightlog: file watcher failed, polling every 5s until a retry succeeds\n');
+  pollTimer = setInterval(tryIngest, INGEST_INTERVAL_MS);
 }
 
 // Start background sync if configured.
