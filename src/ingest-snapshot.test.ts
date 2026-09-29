@@ -118,7 +118,7 @@ describe('a queued prompt is stored as the user message it is', () => {
     ]);
   });
 
-  it('keeps a subagent's queued prompt (no commandMode) on the sidechain, out of prompt readers', async () => {
+  it("keeps a subagent's queued prompt (no commandMode) on the sidechain, out of prompt readers", async () => {
     writeJsonlLine(jsonlPath, {
       type: 'attachment',
       uuid: 's1',
