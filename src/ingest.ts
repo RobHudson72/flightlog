@@ -300,6 +300,48 @@ function extractContentBlocks(line: JsonlLine): ContentBlockRow[] {
   return blocks;
 }
 
+// ── Queued prompts ──────────────────────────────────────────────
+
+/**
+ * CAD-T-668: a prompt submitted while the agent is mid-turn is not written as
+ * a `user` line. Claude Code queues it and records an `attachment` line of
+ * type `queued_command` carrying the prompt, which the agent then receives.
+ * That IS a submitted user turn, so it is stored as one: without this, every
+ * prompt delivered to a busy agent was invisible to readers of user messages
+ * (the fleet's submit receipts confirmed none of them and re-pressed Enter).
+ * Every other line passes through unchanged.
+ */
+function normalizeQueuedCommand(raw: unknown): unknown {
+  if (typeof raw !== 'object' || raw === null) return raw;
+  const line = raw as Record<string, unknown>;
+  if (line['type'] !== 'attachment') return raw;
+  const att = line['attachment'] as Record<string, unknown> | undefined;
+  if (att === undefined || att['type'] !== 'queued_command') return raw;
+  const prompt = att['prompt'];
+  const content =
+    typeof prompt === 'string'
+      ? prompt
+      : Array.isArray(prompt)
+        ? prompt
+            .filter((p): p is { type: string; text: string } => typeof p?.text === 'string')
+            .map((p) => p.text)
+            .join('\n')
+        : null;
+  if (content === null || typeof line['uuid'] !== 'string') return raw;
+  return {
+    type: 'user',
+    uuid: line['uuid'],
+    parentUuid: line['parentUuid'] ?? null,
+    isSidechain: line['isSidechain'] === true,
+    timestamp: line['timestamp'] ?? att['timestamp'],
+    sessionId: line['sessionId'],
+    cwd: line['cwd'] ?? null,
+    gitBranch: line['gitBranch'],
+    version: line['version'],
+    message: { role: 'user', content },
+  };
+}
+
 // ── Single file ingestion ───────────────────────────────────────
 
 function toMessageRow(line: JsonlLine, sessionId: string): MessageRow | null {
@@ -394,7 +436,7 @@ export async function ingestFile(
 
     let parsed: JsonlLine;
     try {
-      parsed = JSON.parse(rawLine) as JsonlLine;
+      parsed = normalizeQueuedCommand(JSON.parse(rawLine)) as JsonlLine;
     } catch {
       // The line is newline-terminated, so this is real corruption. Surface it
       // (the offset still advances: re-reading garbage would never succeed).
