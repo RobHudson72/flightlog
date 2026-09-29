@@ -106,8 +106,7 @@ describe('a queued prompt is stored as the user message it is', () => {
         commandMode: 'prompt',
       },
       // The system-reminder wrapper the agent saw must never be ingested as the text.
-      rendered: [{ content: '<system-reminder>
-The user sent a new message while you were working: …' }],
+      rendered: [{ content: '<system-reminder>\nThe user sent a new message while you were working: …' }],
     });
     await ingestFile(jsonlPath, db);
 
