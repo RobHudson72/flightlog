@@ -303,25 +303,12 @@ function extractContentBlocks(line: JsonlLine): ContentBlockRow[] {
 // ── Single file ingestion ───────────────────────────────────────
 
 function toMessageRow(line: JsonlLine, sessionId: string): MessageRow | null {
-  if (line.type === 'file-history-snapshot') {
-    return {
-      uuid: line.messageId,
-      session_id: sessionId,
-      parent_uuid: null,
-      type: 'file-history-snapshot',
-      role: null,
-      timestamp: line.snapshot.timestamp,
-      model: null,
-      git_branch: null,
-      cwd: null,
-      request_id: null,
-      is_sidechain: false,
-      input_tokens: null,
-      output_tokens: null,
-      cache_read_tokens: null,
-      cache_creation_tokens: null,
-    };
-  }
+  // CAD-T-654: a snapshot is not a message. Its `messageId` is the uuid of
+  // the prompt it precedes, so a row keyed by it won the primary key and the
+  // prompt itself was ignored: about 80% of prompts were stored with no role,
+  // type or cwd. It carries no content (extractContentBlocks returns none),
+  // and nothing reads it.
+  if (line.type === 'file-history-snapshot') return null;
 
   if (line.type === 'user') {
     return {
