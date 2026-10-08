@@ -4,6 +4,7 @@ import os from 'node:os';
 import fs from 'node:fs';
 import { getDb } from './db.js';
 import { ingestFile, filterChangedFiles, isIngestRunning, setQueueMetricsProvider } from './ingest.js';
+import { ROLLOUT_NAME, codexSessionsRoot, ingestCodexFile, resolveCodexHome } from './ingest-codex.js';
 
 // ── Configuration ──────────────────���───────────────────────────
 
@@ -29,7 +30,11 @@ const queuedAt = new Map<string, number>();
 const debounceMap = new Map<string, ReturnType<typeof setTimeout>>();
 let draining = false;
 let drainPromise: Promise<void> | null = null;
+// Queued paths that are Codex rollouts (CAD-T-618): drained through
+// ingestCodexFile, which keeps its own offsets.
+const codexPending = new Set<string>();
 let watcher: FSWatcher | null = null;
+let codexWatcher: FSWatcher | null = null;
 let watcherActive = false;
 let fallbackPolling = false;
 
@@ -60,8 +65,9 @@ export function getQueueMetrics(): QueueMetrics {
 
 // ─��� Enqueue / debounce ───────────���─────────────────────────────
 
-function enqueueFile(filePath: string): void {
+function enqueueFile(filePath: string, codex = false): void {
   const normalized = path.resolve(filePath);
+  if (codex) codexPending.add(normalized);
 
   // Clear any existing debounce timer for this file
   const existing = debounceMap.get(normalized);
@@ -129,6 +135,7 @@ async function drain(): Promise<void> {
       const filePath = pendingQueue.shift()!;
       pendingSet.delete(filePath);
       queuedAt.delete(filePath);
+      const codex = codexPending.delete(filePath);
 
       try {
         if (!fs.existsSync(filePath)) {
@@ -137,6 +144,17 @@ async function drain(): Promise<void> {
         }
 
         const db = getDb();
+
+        if (codex) {
+          const result = await ingestCodexFile(filePath, db);
+          if (result.messagesAdded > 0) {
+            process.stderr.write(
+              `flightlog: watcher ingested ${result.messagesAdded} messages from ${path.basename(filePath)}
+`,
+            );
+          }
+          continue;
+        }
 
         // Determine the byte offset to tail from (incremental)
         const changed = await filterChangedFiles([filePath], db);
@@ -165,7 +183,69 @@ async function drain(): Promise<void> {
 
 // ── Watcher lifecycle ���─────────────────────────────────────────
 
-export async function startWatcher(watchPath?: string): Promise<boolean> {
+function awaitReady(w: FSWatcher): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const timeoutId = setTimeout(
+      () => reject(new Error(`Watcher initialization timed out after ${READY_TIMEOUT_MS} ms`)),
+      READY_TIMEOUT_MS,
+    );
+    w.on('ready', () => {
+      clearTimeout(timeoutId);
+      resolve();
+    });
+  });
+}
+
+/**
+ * CAD-T-618: watches `<codexHome>/sessions/YYYY/MM/DD/rollout-*.jsonl` through
+ * the same queue (debounce, ingest-lock wait) as Claude transcripts. Depth 3
+ * covers the date directories, including ones Codex creates after the watch
+ * starts. A missing sessions root is a logged no-op (Codex never ran here):
+ * never created, never an error; `ingestAll` still reads it once it appears.
+ */
+async function startCodexWatcher(codexHome: string): Promise<void> {
+  const root = codexSessionsRoot(codexHome);
+  if (!fs.existsSync(root)) {
+    process.stderr.write(`flightlog: no Codex sessions at ${root}, not watching Codex\n`);
+    return;
+  }
+  const watchStart = performance.now();
+  codexWatcher = chokidar.watch(root, {
+    ignoreInitial: true,
+    persistent: true,
+    awaitWriteFinish: false,
+    depth: 3,
+    ignored: (entryPath: string, stats?: fs.Stats): boolean => {
+      if (!stats) return false;
+      if (stats.isDirectory()) return path.relative(root, entryPath).split(path.sep).length > 3;
+      return !ROLLOUT_NAME.test(path.basename(entryPath));
+    },
+  });
+  const onFile = (filePath: string): void => {
+    if (ROLLOUT_NAME.test(path.basename(filePath))) enqueueFile(filePath, true);
+  };
+  codexWatcher.on('add', onFile);
+  codexWatcher.on('change', onFile);
+  codexWatcher.on('error', (error: unknown) => {
+    const msg = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`flightlog: Codex watcher error: ${msg}\n`);
+  });
+  await awaitReady(codexWatcher);
+  process.stderr.write(
+    `flightlog: watching ${root} (ready in ${Math.round(performance.now() - watchStart)} ms)\n`,
+  );
+}
+
+/**
+ * Watches Claude transcripts under `watchPath` and Codex rollouts under
+ * `codexHome` (null: no Codex watch). A caller that names its own projects
+ * dir (a test, a scoped watch) names its Codex home too and never inherits
+ * the operator's; with neither named, both are the operator's own.
+ */
+export async function startWatcher(
+  watchPath?: string,
+  codexHome: string | null = watchPath === undefined ? resolveCodexHome() : null,
+): Promise<boolean> {
   const projectsDir = watchPath ?? getClaudeProjectsDir();
 
   // Register queue metrics provider with ingest module
@@ -222,22 +302,17 @@ export async function startWatcher(watchPath?: string): Promise<boolean> {
     });
 
     // Wait for the watcher to be ready, with a timeout
-    await new Promise<void>((resolve, reject) => {
-      const timeoutId = setTimeout(
-        () => reject(new Error(`Watcher initialization timed out after ${READY_TIMEOUT_MS} ms`)),
-        READY_TIMEOUT_MS,
-      );
-      watcher!.on('ready', () => {
-        clearTimeout(timeoutId);
-        resolve();
-      });
-    });
-
-    watcherActive = true;
-    fallbackPolling = false; // a recovered watcher clears the fallback flag
+    await awaitReady(watcher);
     process.stderr.write(
       `flightlog: watching ${projectsDir} (ready in ${Math.round(performance.now() - watchStart)} ms)\n`,
     );
+
+    // A Codex watch that fails to come up fails the start, so the retry below
+    // covers it exactly as it covers the Claude watch.
+    if (codexHome !== null) await startCodexWatcher(codexHome);
+
+    watcherActive = true;
+    fallbackPolling = false; // a recovered watcher clears the fallback flag
     return true;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -251,6 +326,13 @@ export async function startWatcher(watchPath?: string): Promise<boolean> {
         process.stderr.write(`flightlog: error closing failed watcher: ${closeMsg}\n`);
       });
       watcher = null;
+    }
+    if (codexWatcher) {
+      await codexWatcher.close().catch((closeErr: unknown) => {
+        const closeMsg = closeErr instanceof Error ? closeErr.message : String(closeErr);
+        process.stderr.write(`flightlog: error closing failed Codex watcher: ${closeMsg}\n`);
+      });
+      codexWatcher = null;
     }
 
     return false;
@@ -331,10 +413,15 @@ export async function stopWatcher(): Promise<void> {
   pendingQueue.length = 0;
   pendingSet.clear();
   queuedAt.clear();
+  codexPending.clear();
 
   if (watcher) {
     await watcher.close();
     watcher = null;
+  }
+  if (codexWatcher) {
+    await codexWatcher.close();
+    codexWatcher = null;
   }
   watcherActive = false;
   fallbackPolling = false;

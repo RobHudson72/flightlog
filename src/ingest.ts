@@ -23,6 +23,19 @@ import {
   upsertIngestLog,
   upsertIngestOffset,
 } from './db.js';
+import {
+  CodexRolloutRefusedError,
+  codexFileKey,
+  discoverCodexRollouts,
+  ingestCodexFile,
+  isUnderCodexSessions,
+  resolveCodexHome,
+} from './ingest-codex.js';
+
+// CAD-T-618: the per-file Codex entry point, and the capability flag that
+// parallel-code's `find-tags` feature-detects on dist/ingest.js (CAD-T-614).
+export { ingestCodexFile };
+export const CODEX_INGEST = true;
 
 // ── File discovery ──────────────────────────────────────────────
 
@@ -121,13 +134,17 @@ async function legacyResumePoint(filePath: string, legacySize: number, fileSize:
  * legacy `ingest_log` row, backed up by a couple of lines → full read. The
  * legacy branch never short-circuits on "same size": the old server's size
  * can cover a line it never read, so the bootstrap runs once per file.
+ * `key` is the file's row key in `ingest_offsets`/`ingest_log`; it differs
+ * from `filePath` only for a Codex rollout (CAD-T-618 `codexFileKey`), and the
+ * file itself is always read through `filePath`, the caller's spelling.
  */
 export async function resolveStart(
   db: Database.Database,
   filePath: string,
   fileSize: number,
+  key: string = filePath,
 ): Promise<IngestStart | null> {
-  const known = getIngestOffset(db, filePath);
+  const known = getIngestOffset(db, key);
   if (known) {
     if (fileSize === known.byte_offset) return null;
     if (fileSize < known.byte_offset) {
@@ -139,7 +156,7 @@ export async function resolveStart(
     return { offset: known.byte_offset, lines: known.lines_consumed };
   }
 
-  const legacy = getIngestLog(db, filePath);
+  const legacy = getIngestLog(db, key);
   if (!legacy) return FULL_READ;
 
   const resume = await legacyResumePoint(filePath, legacy.file_size, fileSize);
@@ -181,7 +198,7 @@ interface CompleteLine {
  * caller's recorded offset is always a line boundary. A trailing `\r` is
  * stripped so CRLF files parse; the offset still counts it.
  */
-async function* readCompleteLines(filePath: string, start: number): AsyncGenerator<CompleteLine> {
+export async function* readCompleteLines(filePath: string, start: number): AsyncGenerator<CompleteLine> {
   const stream = fs.createReadStream(filePath, { start });
   const pending: Buffer[] = [];
   let chunkStart = start;
@@ -235,6 +252,18 @@ function extractContentBlocks(line: JsonlLine): ContentBlockRow[] {
             block_index: i,
             block_type: 'tool_result',
             text_content: typeof block.content === 'string' ? block.content : JSON.stringify(block.content),
+            tool_name: null,
+            tool_input: null,
+          });
+        } else if (block.type === 'text') {
+          // CAD-T-618 (round-3 B1): a user turn written as an array keeps its
+          // text, as the prompt it is; it used to be dropped, so no reader of
+          // user_text (the fleet's submit receipts among them) could see it.
+          blocks.push({
+            message_uuid: messageUuid,
+            block_index: i,
+            block_type: 'user_text',
+            text_content: block.text,
             tool_name: null,
             tool_input: null,
           });
@@ -414,12 +443,15 @@ export interface IngestFileResult {
  * session row or content blocks: session upsert and block inserts run on
  * every pass, and only `messagesAdded` depends on whether the insert was new.
  * `sessions.message_count` is derived from `messages` at the end of a pass.
+ * A Codex rollout is refused by name (CAD-T-618 round-4 NF2): see
+ * `CodexRolloutRefusedError`.
  */
 export async function ingestFile(
   filePath: string,
   db: Database.Database,
   start: IngestStart = FULL_READ,
 ): Promise<IngestFileResult> {
+  if (isUnderCodexSessions(filePath)) throw new CodexRolloutRefusedError(filePath);
   const sessionId = path.basename(filePath, '.jsonl');
   let project: string | null = null;
   let linesConsumed = start.lines;
@@ -473,6 +505,7 @@ export async function ingestFile(
       messageRow.git_branch,
       messageRow.cwd,
       'version' in parsed ? (parsed.version ?? null) : null,
+      'claude',
     );
     sessionTouched = true;
 
@@ -563,7 +596,7 @@ let ingestRunning = false;
 export function triggerIngest(ingestPath?: string): IngestProgress {
   if (!ingestRunning) {
     // Fire and forget — runs in background
-    ingestAllInner(ingestPath).catch((e) => {
+    ingestAllInner(ingestPath, defaultCodexHome(ingestPath)).catch((e) => {
       const msg = e instanceof Error ? e.message : String(e);
       progress.errors.push(msg);
       progress.status = 'idle';
@@ -574,9 +607,24 @@ export function triggerIngest(ingestPath?: string): IngestProgress {
 }
 
 /**
- * Blocking version — waits for ingestion to complete. Used by auto-ingest timer.
+ * CAD-T-618: the Codex home `ingestAll` reads when its caller names none. The
+ * whole-tree ingest (no path: the MCP servers, parallel-code's query worker)
+ * reads the operator's Codex home; a caller that names its own path (a test,
+ * `flightlog_ingest` with a path) ingests exactly that path, never the
+ * operator's rollouts.
  */
-export async function ingestAll(ingestPath?: string): Promise<IngestSummary> {
+function defaultCodexHome(ingestPath: string | undefined): string | null {
+  return ingestPath === undefined ? resolveCodexHome() : null;
+}
+
+/**
+ * Blocking version — waits for ingestion to complete. Used by auto-ingest timer.
+ * Claude transcripts first, then Codex rollouts from `codexHome` (null: none).
+ */
+export async function ingestAll(
+  ingestPath?: string,
+  codexHome: string | null = defaultCodexHome(ingestPath),
+): Promise<IngestSummary> {
   if (ingestRunning) {
     // Return a summary reflecting "nothing to do, already running"
     return {
@@ -585,12 +633,16 @@ export async function ingestAll(ingestPath?: string): Promise<IngestSummary> {
       messages_added: 0,
       content_blocks_added: 0,
       errors: ['Ingest already in progress'],
+      codex_skipped_line_types: {},
     };
   }
-  return ingestAllInner(ingestPath);
+  return ingestAllInner(ingestPath, codexHome);
 }
 
-async function ingestAllInner(ingestPath?: string): Promise<IngestSummary> {
+const byMtimeDesc = (a: FileToIngest, b: FileToIngest): number =>
+  fs.statSync(b.filePath).mtimeMs - fs.statSync(a.filePath).mtimeMs;
+
+async function ingestAllInner(ingestPath: string | undefined, codexHome: string | null): Promise<IngestSummary> {
   ingestRunning = true;
   progress.status = 'running';
   progress.errors = [];
@@ -616,33 +668,60 @@ async function ingestAllInner(ingestPath?: string): Promise<IngestSummary> {
     const toIngest = await filterChangedFiles(files, db);
 
     // Sort by mtime descending — most recent conversations first
-    toIngest.sort((a, b) => {
-      const mtimeA = fs.statSync(a.filePath).mtimeMs;
-      const mtimeB = fs.statSync(b.filePath).mtimeMs;
-      return mtimeB - mtimeA;
-    });
+    toIngest.sort(byMtimeDesc);
+
+    // CAD-T-618: Codex rollouts after Claude transcripts, so parallel-code's
+    // query worker (which calls ingestAll per query) sees Codex with no
+    // watcher running. The start is resolved under the key the rollout's
+    // offset is stored by; the path itself is kept, since its basename is
+    // the session id.
+    const codexFiles = codexHome === null ? [] : discoverCodexRollouts(codexHome);
+    const codexToIngest: FileToIngest[] = [];
+    for (const filePath of codexFiles) {
+      const start = await resolveStart(db, filePath, fs.statSync(filePath).size, codexFileKey(filePath));
+      if (start) codexToIngest.push({ filePath, start });
+    }
+    codexToIngest.sort(byMtimeDesc);
+
+    const totalFiles = files.length + codexFiles.length;
+    const pending = toIngest.length + codexToIngest.length;
 
     // Update progress with totals
-    progress.total_files = files.length;
-    progress.files_ingested = files.length - toIngest.length;
-    progress.files_remaining = toIngest.length;
-    progress.percent_complete = files.length > 0
-      ? Math.round((progress.files_ingested / files.length) * 100)
+    progress.total_files = totalFiles;
+    progress.files_ingested = totalFiles - pending;
+    progress.files_remaining = pending;
+    progress.percent_complete = totalFiles > 0
+      ? Math.round((progress.files_ingested / totalFiles) * 100)
       : 100;
 
     const summary: IngestSummary = {
       files_processed: 0,
-      files_skipped: files.length - toIngest.length,
+      files_skipped: totalFiles - pending,
       messages_added: 0,
       content_blocks_added: 0,
       errors: [],
+      codex_skipped_line_types: {},
     };
 
-    for (const { filePath, start } of toIngest) {
+    const queue = [
+      ...toIngest.map(f => ({ ...f, codex: false })),
+      ...codexToIngest.map(f => ({ ...f, codex: true })),
+    ];
+
+    for (const { filePath, start, codex } of queue) {
       progress.current_file = path.basename(filePath, '.jsonl');
 
       try {
-        const result = await ingestFile(filePath, db, start);
+        let result: IngestFileResult;
+        if (codex) {
+          const codexResult = await ingestCodexFile(filePath, db, start);
+          for (const [type, n] of Object.entries(codexResult.skippedLineTypes)) {
+            summary.codex_skipped_line_types[type] = (summary.codex_skipped_line_types[type] ?? 0) + n;
+          }
+          result = codexResult;
+        } else {
+          result = await ingestFile(filePath, db, start);
+        }
         summary.files_processed++;
         summary.messages_added += result.messagesAdded;
         summary.content_blocks_added += result.blocksAdded;

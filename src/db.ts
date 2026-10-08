@@ -16,6 +16,7 @@ import type {
   TailResult,
   SyncState,
   SessionRow,
+  SessionSource,
 } from './types.js';
 
 // ── Database connection management ──────────────────────────────
@@ -94,7 +95,8 @@ function ensureSchema(db: Database.Database): void {
       git_branch    TEXT,
       cwd           TEXT,
       message_count INTEGER DEFAULT 0,
-      version       TEXT
+      version       TEXT,
+      source        TEXT NOT NULL DEFAULT 'claude'
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -170,6 +172,26 @@ function ensureSchema(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_sessions_started_at ON sessions(started_at);
     CREATE INDEX IF NOT EXISTS idx_sessions_git_branch ON sessions(git_branch);
   `);
+
+  // CAD-T-618 (round-3 B2): `CREATE TABLE IF NOT EXISTS` never alters a table
+  // that already exists, so a pre-L3 DB gets `source` by migration.
+  const columns = db.prepare(`PRAGMA table_info(sessions)`).all() as { name: string }[];
+  if (!columns.some(c => c.name === 'source')) addSessionsSourceColumn(db);
+}
+
+/**
+ * Adds `sessions.source` (CAD-T-618). Thirteen servers share one DB and start
+ * together, so another one can add the column between our PRAGMA check and
+ * this ALTER; its "duplicate column" error means the migration is done.
+ * Exported for the test that pins that tolerance.
+ */
+export function addSessionsSourceColumn(db: Database.Database): void {
+  try {
+    db.exec(`ALTER TABLE sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'claude'`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (!/duplicate column name/i.test(msg)) throw e;
+  }
 }
 
 // ── Insert helpers ──────────────────────────────────────────────
@@ -182,16 +204,51 @@ export function upsertSession(
   gitBranch: string | null,
   cwd: string | null,
   version: string | null,
+  source: SessionSource,
 ): void {
   db.prepare(`
-    INSERT INTO sessions (session_id, project, started_at, last_message_at, git_branch, cwd, message_count, version)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+    INSERT INTO sessions (session_id, project, started_at, last_message_at, git_branch, cwd, message_count, version, source)
+    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
     ON CONFLICT (session_id) DO UPDATE SET
       last_message_at = CASE WHEN excluded.last_message_at > sessions.last_message_at
                              THEN excluded.last_message_at ELSE sessions.last_message_at END,
       git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
       version = COALESCE(excluded.version, sessions.version)
-  `).run(sessionId, project, timestamp, timestamp, gitBranch, cwd, version);
+  `).run(sessionId, project, timestamp, timestamp, gitBranch, cwd, version, source);
+}
+
+/**
+ * Overwrites a Codex session's identity from its `session_meta` line
+ * (CAD-T-618). The row may already exist without it: a rollout whose first
+ * line was unreadable gets a placeholder project, and the meta line, when it
+ * is read, is the record that names it.
+ */
+export function applyCodexSessionMeta(
+  db: Database.Database,
+  sessionId: string,
+  project: string,
+  startedAt: string,
+  gitBranch: string | null,
+  cwd: string | null,
+  version: string | null,
+): void {
+  db.prepare(`
+    UPDATE sessions SET
+      project = ?,
+      started_at = CASE WHEN ? < started_at THEN ? ELSE started_at END,
+      git_branch = COALESCE(?, git_branch),
+      cwd = COALESCE(?, cwd),
+      version = COALESCE(?, version)
+    WHERE session_id = ?
+  `).run(project, startedAt, startedAt, gitBranch, cwd, version, sessionId);
+}
+
+/** The stored cwd of a session, or null when the row or its cwd is absent. */
+export function getSessionCwd(db: Database.Database, sessionId: string): string | null {
+  const row = db.prepare(`SELECT cwd FROM sessions WHERE session_id = ?`).get(sessionId) as
+    | { cwd: string | null }
+    | undefined;
+  return row?.cwd ?? null;
 }
 
 /**

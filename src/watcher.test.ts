@@ -103,6 +103,79 @@ describe('watcher', () => {
   });
 });
 
+/**
+ * CAD-T-618: the watcher also watches `<codexHome>/sessions`, where Codex
+ * creates a YYYY/MM/DD directory per day; a rollout appearing at that depth
+ * after the watch starts is ingested live.
+ */
+describe('watcher on Codex rollouts', () => {
+  let tmpDir: string;
+  let projectDir: string;
+  let codexHome: string;
+
+  beforeEach(() => {
+    tmpDir = makeTmpDir();
+    projectDir = path.join(tmpDir, 'projects');
+    codexHome = path.join(tmpDir, 'codex-home');
+    fs.mkdirSync(projectDir, { recursive: true });
+    process.env['FLIGHTLOG_DB_PATH'] = path.join(tmpDir, 'test.db');
+  });
+
+  afterEach(async () => {
+    await stopWatcher();
+    closeDb();
+    delete process.env['FLIGHTLOG_DB_PATH'];
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* Windows file locks */ }
+  });
+
+  function codexMessage(role: string, text: string): Record<string, unknown> {
+    return {
+      timestamp: new Date().toISOString(),
+      type: 'response_item',
+      payload: { type: 'message', role, content: [{ type: role === 'user' ? 'input_text' : 'output_text', text }] },
+    };
+  }
+
+  it('ingests a rollout that appears in a date directory created after the watch started, then its appended lines', async () => {
+    const db = getDb();
+    resetDatabase(db);
+    fs.mkdirSync(path.join(codexHome, 'sessions'), { recursive: true });
+    expect(await startWatcher(projectDir, codexHome)).toBe(true);
+
+    const dayDir = path.join(codexHome, 'sessions', '2026', '10', '07');
+    fs.mkdirSync(dayDir, { recursive: true });
+    const basename = 'rollout-2026-10-07T09-00-00-0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b';
+    const rollout = path.join(dayDir, `${basename}.jsonl`);
+    writeJsonlLine(rollout, {
+      timestamp: new Date().toISOString(),
+      type: 'session_meta',
+      payload: { id: '0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b', cwd: '/w/codex-ipc-2', cli_version: '0.156.1' },
+    });
+    writeJsonlLine(rollout, codexMessage('user', '[e:live1] MARKER_CODEX_LIVE'));
+
+    await waitFor(() => searchContentBlocks(db, 'MARKER_CODEX_LIVE', {}).length >= 1);
+    const hit = searchContentBlocks(db, 'MARKER_CODEX_LIVE', {})[0]!;
+    expect(hit).toMatchObject({ session_id: basename, project: 'codex:codex-ipc-2', role: 'user', block_type: 'user_text' });
+
+    writeJsonlLine(rollout, codexMessage('assistant', 'MARKER_CODEX_REPLY'));
+    await waitFor(() => searchContentBlocks(db, 'MARKER_CODEX_REPLY', {}).length >= 1);
+    expect(searchContentBlocks(db, 'MARKER_CODEX_LIVE', {}).length).toBe(1);
+  });
+
+  it('starts, and still watches Claude transcripts, when the Codex home is missing', async () => {
+    const db = getDb();
+    resetDatabase(db);
+    expect(await startWatcher(projectDir, path.join(tmpDir, 'no-codex-here'))).toBe(true);
+    expect(getQueueMetrics().watcher_active).toBe(true);
+    expect(fs.existsSync(path.join(tmpDir, 'no-codex-here'))).toBe(false);
+
+    const subDir = path.join(projectDir, 'test-project');
+    fs.mkdirSync(subDir);
+    writeJsonlLine(path.join(subDir, 'claude-1.jsonl'), makeUserMessage('m1', 'MARKER_CLAUDE_STILL', 'claude-1'));
+    await waitFor(() => searchContentBlocks(db, 'MARKER_CLAUDE_STILL', {}).length >= 1);
+  });
+});
+
 describe('watcher fallback recovery', () => {
   it('clears fallback_polling when a later start succeeds', async () => {
     const tmp = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'flightlog-retry-'));

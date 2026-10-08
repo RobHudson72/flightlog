@@ -19,7 +19,7 @@ export interface JsonlUserMessage {
   promptId?: string;
   message: {
     role: 'user';
-    content: string | JsonlToolResultBlock[];
+    content: string | (JsonlToolResultBlock | JsonlUserTextBlock)[];
   };
   timestamp: string;
   sessionId: string;
@@ -73,7 +73,42 @@ export type JsonlToolResultBlock = {
   tool_use_id: string;
 };
 
+/** A text item in a user message's array content (CAD-T-618 round-3 B1). */
+export type JsonlUserTextBlock = { type: 'text'; text: string };
+
 export type JsonlLine = JsonlSnapshotMessage | JsonlUserMessage | JsonlAssistantMessage;
+
+// ── Codex rollout line types (CAD-T-618) ────────────────────────
+//
+// `<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl`. Only the two shapes
+// flightlog stores are typed; every other line is skipped and counted.
+
+export interface CodexSessionMetaLine {
+  type: 'session_meta';
+  timestamp?: string;
+  payload: {
+    id?: string;
+    cwd?: string;
+    cli_version?: string;
+    timestamp?: string;
+    git?: { branch?: string };
+  };
+}
+
+export interface CodexContentItem {
+  type: string;
+  text?: string;
+}
+
+export interface CodexResponseItemLine {
+  type: 'response_item';
+  timestamp?: string;
+  payload: {
+    type: string;
+    role?: string;
+    content?: CodexContentItem[];
+  };
+}
 
 // ── DB row types ────────────────────────────────────────────────
 
@@ -86,7 +121,11 @@ export interface SessionRow {
   cwd: string | null;
   message_count: number;
   version: string | null;
+  /** Which agent wrote the transcript (CAD-T-618); pre-L3 rows read 'claude'. */
+  source: SessionSource;
 }
+
+export type SessionSource = 'claude' | 'codex';
 
 export interface MessageRow {
   uuid: string;
@@ -196,6 +235,8 @@ export interface IngestSummary {
   messages_added: number;
   content_blocks_added: number;
   errors: string[];
+  /** Codex rollout lines skipped by type, never guessed at (CAD-T-618). */
+  codex_skipped_line_types: Record<string, number>;
 }
 
 export interface StatsResult {
