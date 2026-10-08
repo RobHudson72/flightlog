@@ -1,7 +1,46 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import { startWatcher, stopWatcher, getQueueMetrics } from './watcher.js';
+
+/**
+ * CAD-T-656: a gate in front of the real `ingestFile`, so a test can hold the
+ * watcher's drain mid-file and observe the queue it builds. Open by default:
+ * every other test here ingests exactly as production does.
+ */
+const ingestGate = vi.hoisted(() => {
+  let release: (() => void) | null = null;
+  let closed: Promise<void> | null = null;
+  return {
+    /** Paths whose ingest is waiting at the closed gate. */
+    held: [] as string[],
+    close(): void {
+      closed = new Promise<void>((r) => { release = r; });
+    },
+    open(): void {
+      release?.();
+      release = null;
+      closed = null;
+      this.held.length = 0;
+    },
+    async pass(filePath: string): Promise<void> {
+      if (closed === null) return;
+      this.held.push(filePath);
+      await closed;
+    },
+  };
+});
+
+vi.mock('./ingest.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./ingest.js')>();
+  return {
+    ...actual,
+    ingestFile: async (...args: Parameters<typeof actual.ingestFile>) => {
+      await ingestGate.pass(args[0]);
+      return actual.ingestFile(...args);
+    },
+  };
+});
 import { getDb, closeDb, resetDatabase, searchContentBlocks } from './db.js';
 import type Database from 'better-sqlite3';
 import {
@@ -221,6 +260,15 @@ describe('watcher stress tests', () => {
     expect(p90).toBeLessThan(500);
   }, 60_000);
 
+  /**
+   * CAD-T-656: this used to sample the queue once, 60 ms after the burst, and
+   * failed whenever the scheduler had not yet delivered the burst to it. On a
+   * loaded fleet box chokidar's events land ~40-50 ms after the writes and the
+   * 30 ms debounce follows, so at 60 ms the queue was still empty (measured:
+   * empty until ~78 ms, peak 31 at ~105 ms, drained by ~180 ms). A wall-clock
+   * sample, not a watcher defect. The ingest step is now held closed, so the
+   * burst is observable in the queue by construction, whatever the load.
+   */
   it('queue depth is observable during burst writes', async () => {
     const db = getDb();
     resetDatabase(db);
@@ -229,29 +277,41 @@ describe('watcher stress tests', () => {
     const BURST_FILES = 50;
     const subDir = path.join(projectDir, 'burst');
     fs.mkdirSync(subDir);
+    const sessionIds = Array.from({ length: BURST_FILES }, (_, i) => `burst-${i.toString().padStart(3, '0')}`);
 
-    // Write many files as fast as possible — queue should build up
-    for (let i = 0; i < BURST_FILES; i++) {
-      const sessionId = `burst-${i.toString().padStart(3, '0')}`;
-      const jsonlPath = path.join(subDir, `${sessionId}.jsonl`);
-      writeJsonlLine(jsonlPath, makeUserMessage(`msg-${i}`, `burst content ${i}`, sessionId));
+    ingestGate.close();
+    try {
+      // Write many files as fast as possible — queue should build up
+      for (let i = 0; i < BURST_FILES; i++) {
+        const jsonlPath = path.join(subDir, `${sessionIds[i]}.jsonl`);
+        writeJsonlLine(jsonlPath, makeUserMessage(`msg-${i}`, `burst content ${i}`, sessionIds[i]!));
+      }
+
+      // With ingest held, every burst file ends up either waiting in the queue
+      // or held inside the one ingest the drain has started; the state is then
+      // stable until the gate opens, so this wait observes it, never races it.
+      const accountedFor = (): Set<string> => new Set([
+        ...getQueueMetrics().queued_paths,
+        ...ingestGate.held.map(p => path.basename(p, '.jsonl')),
+      ]);
+      await waitFor(() => sessionIds.every(id => accountedFor().has(id)), 30_000, 10);
+      const midBurstMetrics = getQueueMetrics();
+
+      process.stderr.write('\n── Stress: queue depth observability ──\n');
+      process.stderr.write(`  Burst files:      ${BURST_FILES}\n`);
+      process.stderr.write(`  Queue (held):     ${midBurstMetrics.queue_depth}\n`);
+      process.stderr.write(`  In ingest:        ${ingestGate.held.length}\n`);
+      process.stderr.write(`  Oldest pending:   ${midBurstMetrics.oldest_queued_since}\n`);
+
+      // The drain takes one file at a time, so all but the one in ingest wait.
+      expect(ingestGate.held.length).toBe(1);
+      expect(midBurstMetrics.queue_depth).toBeGreaterThanOrEqual(BURST_FILES - 1);
+      expect(midBurstMetrics.queued_paths.length).toBe(midBurstMetrics.queue_depth);
+      expect(midBurstMetrics.oldest_queued_since).not.toBeNull();
+      expect(countMessages(db)).toBe(0);
+    } finally {
+      ingestGate.open();
     }
-
-    // Sample queue depth immediately — should be non-zero during burst
-    // (the debounce is 30ms so we wait just past it)
-    await new Promise(r => setTimeout(r, 60));
-    const midBurstMetrics = getQueueMetrics();
-
-    process.stderr.write('\n── Stress: queue depth observability ──\n');
-    process.stderr.write(`  Burst files:      ${BURST_FILES}\n`);
-    process.stderr.write(`  Queue at 150ms:   ${midBurstMetrics.queue_depth}\n`);
-    process.stderr.write(`  Queued paths:     ${midBurstMetrics.queued_paths.length}\n`);
-    process.stderr.write(`  Oldest pending:   ${midBurstMetrics.oldest_queued_since}\n`);
-
-    // Queue should have items in it (the drain can't process all 50 files in 150ms)
-    expect(midBurstMetrics.queue_depth).toBeGreaterThan(0);
-    expect(midBurstMetrics.oldest_queued_since).not.toBeNull();
-    expect(midBurstMetrics.queued_paths.length).toBeGreaterThan(0);
 
     // Wait for full drain
     await waitFor(() => countMessages(db) >= BURST_FILES, 30_000, 100);
