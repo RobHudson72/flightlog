@@ -102,7 +102,7 @@ function readUsageRecord(json: unknown): UsageRead {
   };
 }
 
-export type UsageRecordResult =
+type UsageRecordResult =
   | { ok: true; input: number; output: number; cacheRead: number; cacheCreation: number; synthetic: boolean }
   | { ok: false; reason: UsageRefusalReason };
 
