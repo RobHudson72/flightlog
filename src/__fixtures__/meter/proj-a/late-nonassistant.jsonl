@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_ln1","model":"claude-x","role":"assistant","content":"SECRET-CONTENT-MARKER","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}},"timestamp":"2026-11-01T10:00:00.000Z","requestId":"req_ln1"}
+{"type":"user","timestamp":"2026-11-01T10:08:00.000Z","message":{"id":"msg_ln2","role":"user","usage":{"input_tokens":9,"output_tokens":9,"cache_read_input_tokens":9,"cache_creation_input_tokens":9}}}

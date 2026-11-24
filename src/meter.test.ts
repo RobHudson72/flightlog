@@ -387,6 +387,85 @@ describe('flightlog-meter', () => {
     });
   });
 
+  describe('the latest timestamp on a refused line, per reason', () => {
+    it('reads a line refused as schema', () => {
+      const { exitCode, doc } = run('--session', 'late-schema');
+      expect(exitCode).toBe(4);
+      expect(doc.refusals).toEqual([
+        { file: path.join(projects, 'proj-a', 'late-schema.jsonl'), line: 2, reason: 'schema' },
+      ]);
+      expectCounts(doc.ids[0], u(1, 1, 1, 1), 1);
+      expect(doc.ids[0].first_timestamp).toBe('2026-11-01T10:00:00.000Z');
+      expect(doc.ids[0].last_timestamp).toBe('2026-11-01T10:09:00.000Z');
+      expect(doc.ids[0].wall_seconds).toBe(9 * 60);
+    });
+
+    it('reads a line refused as usage-on-non-assistant', () => {
+      const { exitCode, doc } = run('--session', 'late-nonassistant');
+      expect(exitCode).toBe(4);
+      expect(doc.refusals).toEqual([
+        { file: path.join(projects, 'proj-a', 'late-nonassistant.jsonl'), line: 2, reason: 'usage-on-non-assistant' },
+      ]);
+      expectCounts(doc.ids[0], u(1, 1, 1, 1), 1);
+      expect(doc.ids[0].first_timestamp).toBe('2026-11-01T10:00:00.000Z');
+      expect(doc.ids[0].last_timestamp).toBe('2026-11-01T10:08:00.000Z');
+      expect(doc.ids[0].wall_seconds).toBe(8 * 60);
+    });
+  });
+
+  describe('a pair refused inside one file and held with different usage by two others', () => {
+    // K = msg_k/req_k: refuse-a refuses it (line 2), refuse-b holds (3,1,0,0), refuse-c holds (3,2,0,0)
+    const KB = u(3, 1, 0, 0);
+    const KC = u(3, 2, 0, 0);
+    const KA1 = u(1, 1, 1, 1);
+    const KB1 = u(2, 2, 2, 2);
+    const KC1 = u(4, 4, 4, 4);
+    // projects is set in beforeAll, so the paths are read lazily
+    const file = (name: string): string => path.join(projects, 'proj-a', `${name}.jsonl`);
+
+    function expectTotalWithoutK(doc: Doc): void {
+      const t = sum(KA1, KB1, KC1); // K adds nothing to total
+      expect(doc.total.input_tokens).toBe(t.i);
+      expect(doc.total.output_tokens).toBe(t.o);
+      expect(doc.total.cache_read_input_tokens).toBe(t.cr);
+      expect(doc.total.cache_creation_input_tokens).toBe(t.cc);
+      expect(doc.total.tokens_excluding_cache_reads).toBe(excl(t));
+      expect(doc.total.tokens_including_cache_reads).toBe(incl(t));
+      expect(doc.total.responses).toBe(3);
+      expect(doc.total.responses_shared_across_ids).toBe(0);
+    }
+
+    it('refuses the later id (C) and leaves K out of its figures, in order A, B, C', () => {
+      const { exitCode, doc } = run('--session', 'refuse-a', '--session', 'refuse-b', '--session', 'refuse-c');
+      expect(exitCode).toBe(4);
+      expect(doc.refusals).toEqual([
+        { file: file('refuse-a'), line: 2, reason: 'usage-mismatch' }, // A's own refusal
+        { file: file('refuse-c'), line: 1, reason: 'usage-mismatch' }, // C disagrees with the earlier B
+      ]);
+      expect(doc.ids.length).toBe(3);
+      const byId = Object.fromEntries(doc.ids.map((e) => [e.id, e]));
+      expectCounts(byId['refuse-a'], KA1, 1);
+      expectCounts(byId['refuse-b'], sum(KB, KB1), 2); // B keeps K
+      expectCounts(byId['refuse-c'], KC1, 1); // C's K is left out
+      expectTotalWithoutK(doc);
+    });
+
+    it('refuses the later id (B) instead when C comes first, in order C, B, A', () => {
+      const { exitCode, doc } = run('--session', 'refuse-c', '--session', 'refuse-b', '--session', 'refuse-a');
+      expect(exitCode).toBe(4);
+      expect(doc.refusals).toEqual([
+        { file: file('refuse-b'), line: 1, reason: 'usage-mismatch' }, // B disagrees with the earlier C
+        { file: file('refuse-a'), line: 2, reason: 'usage-mismatch' },
+      ]);
+      expect(doc.ids.length).toBe(3);
+      const byId = Object.fromEntries(doc.ids.map((e) => [e.id, e]));
+      expectCounts(byId['refuse-c'], sum(KC, KC1), 2); // C is earlier and keeps K
+      expectCounts(byId['refuse-b'], KB1, 1); // B's K is left out
+      expectCounts(byId['refuse-a'], KA1, 1);
+      expectTotalWithoutK(doc);
+    });
+  });
+
   describe('an id whose file has no timestamped line', () => {
     it('is measured with null time and zero counts, and its lines are counted as other', () => {
       const { exitCode, doc } = run('--session', 'no-time');

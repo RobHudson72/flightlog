@@ -388,7 +388,8 @@ export function runMeter(argv: string[]): MeterResult {
     }
   }
 
-  // a pair refused in any file adds nothing to total
+  // a pair refused inside any one file adds nothing to total, to responses or to the shared count;
+  // it is still compared across ids, so a disagreeing later id is refused and leaves it out
   const refusedAnywhere = new Set<string>();
   for (const m of measures) for (const key of m.refusedPairs) refusedAnywhere.add(key);
 
@@ -403,11 +404,9 @@ export function runMeter(argv: string[]): MeterResult {
     const crossRefusals: Refusal[] = [];
     const leftOut = new Set<string>();
     for (const [key, pair] of m.pairs) {
-      if (refusedAnywhere.has(key)) continue;
       const earlier = seenPairs.get(key);
       if (earlier === undefined) {
         seenPairs.set(key, { usage: pair.usage, files: 1 });
-        addUsage(total, pair.usage);
         continue;
       }
       earlier.files += 1;
@@ -421,14 +420,21 @@ export function runMeter(argv: string[]): MeterResult {
     ids.push(buildEntry(m, leftOut));
   }
 
+  // total counts each pair once at the first id's usage, less any pair refused inside a file
+  let responses = 0;
   let shared = 0;
-  for (const p of seenPairs.values()) if (p.files >= 2) shared += 1;
+  for (const [key, p] of seenPairs) {
+    if (refusedAnywhere.has(key)) continue;
+    addUsage(total, p.usage);
+    responses += 1;
+    if (p.files >= 2) shared += 1;
+  }
 
   const exitCode = refusals.length > 0 ? 4 : unmeasured.length > 0 ? 3 : 0;
   const doc = {
     meter_version: METER_VERSION,
     ids,
-    total: { ...countFields(total), responses: seenPairs.size, responses_shared_across_ids: shared },
+    total: { ...countFields(total), responses, responses_shared_across_ids: shared },
     unmeasured,
     refusals,
     complete: exitCode === 0,
