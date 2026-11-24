@@ -63,7 +63,7 @@ interface Usage {
 }
 
 type ParsedLine =
-  | { kind: 'refused'; reason: string }
+  | { kind: 'refused'; reason: string; timestamp: string | undefined }
   | { kind: 'other'; timestamp: string | undefined }
   | { kind: 'synthetic'; timestamp: string }
   | { kind: 'response'; timestamp: string; model: string; pair: string; usage: Usage };
@@ -73,20 +73,20 @@ function parseLine(raw: string): ParsedLine {
   try {
     json = JSON.parse(raw);
   } catch {
-    return { kind: 'refused', reason: 'invalid-json' };
+    return { kind: 'refused', reason: 'invalid-json', timestamp: undefined };
   }
   const env = envelopeSchema.safeParse(json);
   if (!env.success) {
     const onTimestamp = env.error.issues.some((i) => i.path[0] === 'timestamp');
-    return { kind: 'refused', reason: onTimestamp ? 'bad-timestamp' : 'schema' };
+    return { kind: 'refused', reason: onTimestamp ? 'bad-timestamp' : 'schema', timestamp: undefined };
   }
   const { type, timestamp, message: carriesUsage } = env.data;
   if (type !== 'assistant' || !carriesUsage) {
-    if (carriesUsage) return { kind: 'refused', reason: 'usage-on-non-assistant' };
+    if (carriesUsage) return { kind: 'refused', reason: 'usage-on-non-assistant', timestamp };
     return { kind: 'other', timestamp };
   }
   const rec = recordSchema.safeParse(json);
-  if (!rec.success) return { kind: 'refused', reason: 'schema' };
+  if (!rec.success) return { kind: 'refused', reason: 'schema', timestamp };
   const { message, requestId } = rec.data;
   const usage: Usage = {
     input: message.usage.input_tokens,
@@ -96,7 +96,7 @@ function parseLine(raw: string): ParsedLine {
   };
   if (message.model === SYNTHETIC_MODEL) {
     if (usage.input + usage.output + usage.cacheRead + usage.cacheCreation !== 0) {
-      return { kind: 'refused', reason: 'synthetic-nonzero' };
+      return { kind: 'refused', reason: 'synthetic-nonzero', timestamp: rec.data.timestamp };
     }
     return { kind: 'synthetic', timestamp: rec.data.timestamp };
   }
@@ -127,10 +127,19 @@ interface PairState {
 }
 
 interface FileMeasure {
-  entry: Record<string, unknown>;
+  kind: string;
+  id: string;
+  file: string;
   refusals: Refusal[];
   /** Every counted pair of the file: its last line's usage and line number. */
   pairs: Map<string, { usage: Usage; line: number }>;
+  /** Every pair this file refused. */
+  refusedPairs: Set<string>;
+  models: string[];
+  syntheticLines: number;
+  linesOther: number;
+  first: { ms: number; text: string } | undefined;
+  last: { ms: number; text: string } | undefined;
 }
 
 function sameInputs(a: Usage, b: Usage): boolean {
@@ -189,6 +198,7 @@ function measureFile(kind: string, id: string, file: string): FileMeasure {
     const lineNo = index + 1;
     const parsed = parseLine(raw);
     if (parsed.kind === 'refused') {
+      readTime(parsed.timestamp);
       refusals.push({ file, line: lineNo, reason: parsed.reason });
       return;
     }
@@ -218,28 +228,49 @@ function measureFile(kind: string, id: string, file: string): FileMeasure {
     prev.line = lineNo;
   });
 
-  const totals: Totals = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
   const pairs = new Map<string, { usage: Usage; line: number }>();
+  const refusedPairs = new Set<string>();
   for (const [key, state] of pairStates) {
-    if (state.refused) continue;
-    addUsage(totals, state.usage);
-    pairs.set(key, { usage: state.usage, line: state.line });
+    if (state.refused) refusedPairs.add(key);
+    else pairs.set(key, { usage: state.usage, line: state.line });
   }
-
-  const entry: Record<string, unknown> = {
+  return {
     kind,
     id,
-    path: file,
+    file,
+    refusals,
+    pairs,
+    refusedPairs,
     models: [...models],
-    ...countFields(totals),
-    responses: pairs.size,
-    synthetic_lines: syntheticLines,
-    lines_other: linesOther,
-    first_timestamp: first === undefined ? null : first.text,
-    last_timestamp: last === undefined ? null : last.text,
-    wall_seconds: first === undefined || last === undefined ? null : (last.ms - first.ms) / 1000,
+    syntheticLines,
+    linesOther,
+    first,
+    last,
   };
-  return { entry, refusals, pairs };
+}
+
+/** The id's own figures: its counted pairs, less any the cross-id rule left out. */
+function buildEntry(m: FileMeasure, leftOut: Set<string>): Record<string, unknown> {
+  const totals: Totals = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
+  let responses = 0;
+  for (const [key, pair] of m.pairs) {
+    if (leftOut.has(key)) continue;
+    addUsage(totals, pair.usage);
+    responses += 1;
+  }
+  return {
+    kind: m.kind,
+    id: m.id,
+    path: m.file,
+    models: m.models,
+    ...countFields(totals),
+    responses,
+    synthetic_lines: m.syntheticLines,
+    lines_other: m.linesOther,
+    first_timestamp: m.first === undefined ? null : m.first.text,
+    last_timestamp: m.last === undefined ? null : m.last.text,
+    wall_seconds: m.first === undefined || m.last === undefined ? null : (m.last.ms - m.first.ms) / 1000,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +362,7 @@ function parseArgs(argv: string[]): Args {
   return { projects: projects === undefined ? path.join(os.homedir(), '.claude', 'projects') : projects, wanted };
 }
 
-export interface MeterResult {
+interface MeterResult {
   exitCode: number;
   stdout: string;
   stderr: string;
@@ -344,28 +375,35 @@ export function runMeter(argv: string[]): MeterResult {
   }
 
   const index = indexTranscripts(args.projects);
-  const ids: Record<string, unknown>[] = [];
+  const measures: FileMeasure[] = [];
   const unmeasured: Record<string, unknown>[] = [];
+  for (const want of args.wanted) {
+    const files = (want.kind === 'session' ? index.sessions : index.agents).get(want.id);
+    if (files === undefined) {
+      unmeasured.push({ kind: want.kind, id: want.id, reason: 'not-found' });
+    } else if (files.length > 1) {
+      unmeasured.push({ kind: want.kind, id: want.id, reason: 'ambiguous', paths: files });
+    } else {
+      measures.push(measureFile(want.kind, want.id, files[0]));
+    }
+  }
+
+  // a pair refused in any file adds nothing to total
+  const refusedAnywhere = new Set<string>();
+  for (const m of measures) for (const key of m.refusedPairs) refusedAnywhere.add(key);
+
+  const ids: Record<string, unknown>[] = [];
   const refusals: Refusal[] = [];
   const total: Totals = { input: 0, output: 0, cacheRead: 0, cacheCreation: 0 };
   // every counted pair across ids: the first id's usage, and how many files hold it
   const seenPairs = new Map<string, { usage: Usage; files: number }>();
 
-  for (const want of args.wanted) {
-    const files = (want.kind === 'session' ? index.sessions : index.agents).get(want.id);
-    if (files === undefined) {
-      unmeasured.push({ kind: want.kind, id: want.id, reason: 'not-found' });
-      continue;
-    }
-    if (files.length > 1) {
-      unmeasured.push({ kind: want.kind, id: want.id, reason: 'ambiguous', paths: files });
-      continue;
-    }
-    const measured = measureFile(want.kind, want.id, files[0]);
-    ids.push(measured.entry);
-    refusals.push(...measured.refusals);
+  for (const m of measures) {
+    refusals.push(...m.refusals);
     const crossRefusals: Refusal[] = [];
-    for (const [key, pair] of measured.pairs) {
+    const leftOut = new Set<string>();
+    for (const [key, pair] of m.pairs) {
+      if (refusedAnywhere.has(key)) continue;
       const earlier = seenPairs.get(key);
       if (earlier === undefined) {
         seenPairs.set(key, { usage: pair.usage, files: 1 });
@@ -374,11 +412,13 @@ export function runMeter(argv: string[]): MeterResult {
       }
       earlier.files += 1;
       if (!sameUsage(earlier.usage, pair.usage)) {
-        crossRefusals.push({ file: files[0], line: pair.line, reason: 'usage-mismatch' });
+        crossRefusals.push({ file: m.file, line: pair.line, reason: 'usage-mismatch' });
+        leftOut.add(key);
       }
     }
     crossRefusals.sort((a, b) => a.line - b.line);
     refusals.push(...crossRefusals);
+    ids.push(buildEntry(m, leftOut));
   }
 
   let shared = 0;

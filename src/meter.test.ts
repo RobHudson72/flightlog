@@ -229,9 +229,9 @@ describe('flightlog-meter', () => {
       expect(exitCode).toBe(4);
       expect(doc.complete).toBe(false);
       expect(doc.ids.map((e) => e.id)).toEqual(['share-x', 'share-y', 'z']);
-      // each id's own figures still count every pair, Q at its own usage
+      // share-y's refused Q is left out of its own figures; share-x keeps Q
       expectCounts(doc.ids[0], SHARE_X, 4);
-      expectCounts(doc.ids[1], SHARE_Y, 4);
+      expectCounts(doc.ids[1], sum(P1, P2, Y1), 3);
       expectCounts(doc.ids[2], SHARE_Z, 2);
       // total: P1 (three files), P2 (two), Q at the earlier id's usage, X1, Y1, Z1
       const t = sum(P1, P2, QX, X1, Y1, Z1);
@@ -334,6 +334,59 @@ describe('flightlog-meter', () => {
     });
   });
 
+  describe('time is read from every line whose envelope parsed', () => {
+    it('reads a refused line, but not a line whose own timestamp is bad', () => {
+      const { exitCode, doc } = run('--session', 'late-refused');
+      expect(exitCode).toBe(4);
+      const file = path.join(projects, 'proj-a', 'late-refused.jsonl');
+      expect(doc.refusals).toEqual([
+        { file, line: 2, reason: 'schema' },
+        { file, line: 3, reason: 'usage-on-non-assistant' },
+        { file, line: 4, reason: 'synthetic-nonzero' },
+        { file, line: 5, reason: 'bad-timestamp' },
+      ]);
+      const e = doc.ids[0];
+      expectCounts(e, u(1, 1, 1, 1), 1);
+      // the latest line is the refused synthetic one at 10:07:00; the bad-timestamp line (10:30:00) is not read
+      expect(e.first_timestamp).toBe('2026-11-01T10:00:00.000Z');
+      expect(e.last_timestamp).toBe('2026-11-01T10:07:00.000Z');
+      expect(e.wall_seconds).toBe(7 * 60);
+    });
+  });
+
+  describe('a pair refused in any file', () => {
+    // K = msg_k/req_k: refused inside refuse-a (its second line changes input_tokens), valid in refuse-b
+    const KB = u(3, 1, 0, 0);
+    const KA1 = u(1, 1, 1, 1);
+    const KB1 = u(2, 2, 2, 2);
+
+    it('adds nothing to total, whichever id comes first, and is not shared', () => {
+      for (const argv of [
+        ['--session', 'refuse-a', '--session', 'refuse-b'],
+        ['--session', 'refuse-b', '--session', 'refuse-a'],
+      ]) {
+        const { exitCode, doc } = run(...argv);
+        expect(exitCode, argv.join(' ')).toBe(4);
+        expect(doc.refusals).toEqual([
+          { file: path.join(projects, 'proj-a', 'refuse-a.jsonl'), line: 2, reason: 'usage-mismatch' },
+        ]);
+        const t = sum(KA1, KB1); // K is left out
+        expect(doc.total.input_tokens, argv.join(' ')).toBe(t.i);
+        expect(doc.total.output_tokens).toBe(t.o);
+        expect(doc.total.cache_read_input_tokens).toBe(t.cr);
+        expect(doc.total.cache_creation_input_tokens).toBe(t.cc);
+        expect(doc.total.tokens_excluding_cache_reads).toBe(excl(t));
+        expect(doc.total.tokens_including_cache_reads).toBe(incl(t));
+        expect(doc.total.responses).toBe(2);
+        expect(doc.total.responses_shared_across_ids).toBe(0);
+        expect(doc.ids.length, argv.join(' ')).toBe(2);
+        const byId = Object.fromEntries(doc.ids.map((e) => [e.id, e]));
+        expectCounts(byId['refuse-a'], KA1, 1); // refuse-a's own figures skip K
+        expectCounts(byId['refuse-b'], sum(KB, KB1), 2); // refuse-b's own figures count its valid K
+      }
+    });
+  });
+
   describe('an id whose file has no timestamped line', () => {
     it('is measured with null time and zero counts, and its lines are counted as other', () => {
       const { exitCode, doc } = run('--session', 'no-time');
@@ -397,8 +450,10 @@ describe('flightlog-meter', () => {
     it('is 4 with an unresolved id and a refused line together, both lists filled', () => {
       const { exitCode, doc } = run('--session', 'bad-input', '--session', 'ghost');
       expect(exitCode).toBe(4);
-      expect(doc.refusals.length).toBe(1);
-      expect(doc.unmeasured.length).toBe(1);
+      expect(doc.refusals).toEqual([
+        { file: path.join(projects, 'proj-a', 'bad-input.jsonl'), line: 2, reason: 'usage-mismatch' },
+      ]);
+      expect(doc.unmeasured).toEqual([{ kind: 'session', id: 'ghost', reason: 'not-found' }]);
       expect(doc.ids.map((e) => e.id)).toEqual(['bad-input']);
       expect(doc.complete).toBe(false);
     });
