@@ -1,0 +1,1 @@
+{"type":"assistant","message":{"id":"msg_d2","model":"claude-x","role":"assistant","content":"SECRET-CONTENT-MARKER","usage":{"input_tokens":2,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":2}},"timestamp":"2026-11-01T17:10:00.000Z","requestId":"req_d2"}

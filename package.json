@@ -6,7 +6,8 @@
   "main": "dist/server.js",
   "bin": {
     "mcp-flightlog": "dist/server.js",
-    "flightlog-sync": "dist/sync-cli.js"
+    "flightlog-sync": "dist/sync-cli.js",
+    "flightlog-meter": "dist/meter-cli.js"
   },
   "scripts": {
     "build": "tsc",

@@ -183,6 +183,32 @@ node dist/sync-cli.js
 
 Sync is best-effort. If the remote database is unreachable, Flightlog logs a warning and retries next cycle. Sync failures never affect local operations — all MCP tools continue working normally.
 
+## Token and Time Meter
+
+`flightlog-meter` measures what a ticket's own sessions spent, from their transcripts. It takes the explicit ids that worked on the ticket and prints one JSON document on stdout. It reads local files only: no database, no network, no ledger write, no credential, and it prints no message content.
+
+```bash
+flightlog-meter --session <sessionId> --agent <agentId> [--projects <dir>]
+# or: node dist/meter-cli.js --session <sessionId> --agent <agentId>
+```
+
+`--session` and `--agent` are each repeatable. `--session X` matches only `<projects>/<project>/X.jsonl`; `--agent Y` matches only `<projects>/<project>/<session>/subagents/agent-Y.jsonl`. The same string given as both is two lookups; the same id twice under one flag is measured once. `--projects` defaults to `~/.claude/projects`.
+
+**What it counts.** One API response is written as several transcript lines, so a response is a distinct (`message.id`, `requestId`) pair, and its usage is the pair's LAST line. Earlier lines of a pair are partial streaming counts: they must carry the same `input_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens` as the next line and no larger an `output_tokens`; a line that breaks this is refused, and the pair is not counted. The last line is the last one written, not proof the response finished: a file that holds only a partial line counts its partial value. A pair that appears in two or more of the given files counts once in `total` (`responses_shared_across_ids` counts such pairs); each id's own figures still count it. If two files settle on different usage for a pair, `total` counts the earlier id's usage and a refusal names the pair's last line in the later id's file. `<synthetic>` lines carry no tokens and no request, are counted under `synthetic_lines`, and are never responses. Lines of any other type are skipped for usage and counted under `lines_other`.
+
+**Two token definitions**, both reported per id and in `total`:
+
+- `tokens_excluding_cache_reads` = input + output + cache creation (the harness's definition)
+- `tokens_including_cache_reads` = all four counts (CONSOLE's definition)
+
+The four counts (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`) are reported too. No price table is read or kept: the document says `"dollars": "not measured"`.
+
+**Keys.** Per id (`ids`, in command-line order): `kind`, `id`, `path`, `models`, the four counts, both definitions, `responses`, `synthetic_lines`, `lines_other`, `first_timestamp`, `last_timestamp`, `wall_seconds`. Top level: `meter_version`, `ids`, `total` (the counts, both definitions, `responses`, `responses_shared_across_ids`; no timestamps), `unmeasured` (an id with no file is `not-found`, one matching several files is `ambiguous`; never counted as zero), `refusals` (file, line number, reason), `complete`, and `dollars`.
+
+**Time.** `first_timestamp` and `last_timestamp` are the earliest and latest `timestamp` over every line that carries one; `wall_seconds` is their difference. A resumed subagent appends to the same file, so its span includes the idle time between runs. An id with no timestamped line has null for all three. A timestamp that is not an ISO-8601 instant, on any line, is refused.
+
+**Exit codes.** `0`: every id measured, nothing refused (`complete` is true). `3`: an id is unmeasured, nothing refused. `4`: anything is refused (invalid JSON, a usage line that fails the schema, a pair whose usage changes, a non-zero `<synthetic>` line, usage on a non-assistant line, a bad timestamp), whether or not an id is also unmeasured; the document still prints, with figures from the valid lines. `2`: no ids, an unknown flag, or a flag with no value; usage goes to stderr and no JSON prints.
+
 ## Data Retention
 
 Claude Code retains JSONL conversation logs indefinitely (they grow over time). When you install Flightlog, all existing history is available for ingestion. The database can be rebuilt from source files at any time with `flightlog_rebuild`.

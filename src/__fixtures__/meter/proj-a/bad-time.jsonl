@@ -1,0 +1,5 @@
+{"type":"assistant","message":{"id":"msg_u1","model":"claude-x","role":"assistant","content":"SECRET-CONTENT-MARKER","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":1,"cache_creation_input_tokens":1}},"timestamp":"2026-11-01T15:00:00.000Z","requestId":"req_u1"}
+{"type":"user","timestamp":"yesterday","message":{"role":"user","content":"SECRET-CONTENT-MARKER"}}
+{"type":"user","timestamp":"2026-11-01 15:00:01","message":{"role":"user","content":"SECRET-CONTENT-MARKER"}}
+{"type":"assistant","message":{"id":"msg_u2","model":"claude-x","role":"assistant","content":"SECRET-CONTENT-MARKER","usage":{"input_tokens":4,"output_tokens":4,"cache_read_input_tokens":4,"cache_creation_input_tokens":4}},"timestamp":"not-a-time","requestId":"req_u2"}
+{"type":"assistant","message":{"id":"msg_u3","model":"claude-x","role":"assistant","content":"SECRET-CONTENT-MARKER","usage":{"input_tokens":2,"output_tokens":2,"cache_read_input_tokens":2,"cache_creation_input_tokens":2}},"timestamp":"2026-11-01T15:00:04.000Z","requestId":"req_u3"}
