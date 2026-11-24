@@ -31,6 +31,7 @@ import {
   isUnderCodexSessions,
   resolveCodexHome,
 } from './ingest-codex.js';
+import { parseUsageRecord } from './meter.js';
 
 // CAD-T-618: the per-file Codex entry point, and the capability flag that
 // parallel-code's `find-tags` feature-detects on dist/ingest.js (CAD-T-614).
@@ -373,7 +374,13 @@ function normalizeQueuedCommand(raw: unknown): unknown {
 
 // ── Single file ingestion ───────────────────────────────────────
 
-function toMessageRow(line: JsonlLine, sessionId: string): MessageRow | null {
+interface MessageRowResult {
+  row: MessageRow;
+  /** Set when the line carried `message.usage` and the meter's schema refused it. */
+  usageRefusal: string | null;
+}
+
+function toMessageRow(line: JsonlLine, sessionId: string): MessageRowResult | null {
   // CAD-T-654: a snapshot is not a message. Its `messageId` is the uuid of
   // the prompt it precedes, so a row keyed by it won the primary key and the
   // prompt itself was ignored: about 80% of prompts were stored with no role,
@@ -383,42 +390,56 @@ function toMessageRow(line: JsonlLine, sessionId: string): MessageRow | null {
 
   if (line.type === 'user') {
     return {
-      uuid: line.uuid,
-      session_id: sessionId,
-      parent_uuid: line.parentUuid,
-      type: 'user',
-      role: 'user',
-      timestamp: line.timestamp,
-      model: null,
-      git_branch: line.gitBranch ?? null,
-      cwd: line.cwd,
-      request_id: null,
-      is_sidechain: line.isSidechain,
-      input_tokens: null,
-      output_tokens: null,
-      cache_read_tokens: null,
-      cache_creation_tokens: null,
+      usageRefusal: null,
+      row: {
+        uuid: line.uuid,
+        session_id: sessionId,
+        parent_uuid: line.parentUuid,
+        type: 'user',
+        role: 'user',
+        timestamp: line.timestamp,
+        model: null,
+        git_branch: line.gitBranch ?? null,
+        cwd: line.cwd,
+        request_id: null,
+        is_sidechain: line.isSidechain,
+        input_tokens: null,
+        output_tokens: null,
+        cache_read_tokens: null,
+        cache_creation_tokens: null,
+      },
     };
   }
 
   if (line.type === 'assistant') {
-    const usage = line.message.usage;
+    // IL-T-1619: usage goes through the meter's one schema (M1). A line the
+    // schema refuses is still stored, with NULL counts, and is reported.
+    let usageRefusal: string | null = null;
+    let counts: { input: number; output: number; cacheRead: number; cacheCreation: number } | null = null;
+    if (line.message.usage !== undefined) {
+      const parsed = parseUsageRecord(line);
+      if (parsed.ok) counts = parsed;
+      else usageRefusal = parsed.reason;
+    }
     return {
-      uuid: line.uuid,
-      session_id: sessionId,
-      parent_uuid: line.parentUuid,
-      type: 'assistant',
-      role: 'assistant',
-      timestamp: line.timestamp,
-      model: line.message.model ?? null,
-      git_branch: line.gitBranch ?? null,
-      cwd: line.cwd,
-      request_id: line.requestId ?? null,
-      is_sidechain: line.isSidechain,
-      input_tokens: usage?.input_tokens ?? null,
-      output_tokens: usage?.output_tokens ?? null,
-      cache_read_tokens: usage?.cache_read_input_tokens ?? null,
-      cache_creation_tokens: usage?.cache_creation_input_tokens ?? null,
+      usageRefusal,
+      row: {
+        uuid: line.uuid,
+        session_id: sessionId,
+        parent_uuid: line.parentUuid,
+        type: 'assistant',
+        role: 'assistant',
+        timestamp: line.timestamp,
+        model: line.message.model ?? null,
+        git_branch: line.gitBranch ?? null,
+        cwd: line.cwd,
+        request_id: line.requestId ?? null,
+        is_sidechain: line.isSidechain,
+        input_tokens: counts === null ? null : counts.input,
+        output_tokens: counts === null ? null : counts.output,
+        cache_read_tokens: counts === null ? null : counts.cacheRead,
+        cache_creation_tokens: counts === null ? null : counts.cacheCreation,
+      },
     };
   }
 
@@ -433,6 +454,8 @@ export interface IngestFileResult {
   blocksAdded: number;
   /** Complete lines that failed to parse — a corruption signal, not noise. */
   malformedLines: number;
+  /** Assistant lines whose `message.usage` the meter's schema refused (stored without counts). */
+  usageRefusedLines: number;
 }
 
 /**
@@ -459,6 +482,7 @@ export async function ingestFile(
   let messagesAdded = 0;
   let blocksAdded = 0;
   let malformedLines = 0;
+  let usageRefusedLines = 0;
   let sessionTouched = false;
 
   for await (const { text: rawLine, endOffset } of readCompleteLines(filePath, start.offset)) {
@@ -486,8 +510,18 @@ export async function ingestFile(
       project = parsed.cwd;
     }
 
-    const messageRow = toMessageRow(parsed, sessionId);
-    if (!messageRow) continue;
+    const built = toMessageRow(parsed, sessionId);
+    if (!built) continue;
+    const messageRow = built.row;
+    if (built.usageRefusal !== null) {
+      usageRefusedLines++;
+      if (usageRefusedLines <= MALFORMED_LOG_LIMIT) {
+        process.stderr.write(
+          `flightlog: usage line ending at byte ${endOffset} in ${path.basename(filePath)} failed the usage schema (${built.usageRefusal}); stored without token counts
+`,
+        );
+      }
+    }
 
     // Duplicates (a re-read, or another server that got here first) are
     // ignored by the uuid primary key; only the added-count depends on it.
@@ -532,7 +566,7 @@ export async function ingestFile(
     process.stderr.write(`flightlog: ingest_log not updated for ${path.basename(filePath)}: ${msg}\n`);
   }
 
-  return { messagesAdded, blocksAdded, malformedLines };
+  return { messagesAdded, blocksAdded, malformedLines, usageRefusedLines };
 }
 
 // ── Progress tracking ───────────────────────────────────────────
@@ -728,6 +762,11 @@ async function ingestAllInner(ingestPath: string | undefined, codexHome: string 
         progress.messages_added += result.messagesAdded;
         if (result.malformedLines > 0) {
           const note = `${path.basename(filePath)}: ${result.malformedLines} malformed line(s) skipped`;
+          summary.errors.push(note);
+          progress.errors.push(note);
+        }
+        if (result.usageRefusedLines > 0) {
+          const note = `${path.basename(filePath)}: ${result.usageRefusedLines} usage line(s) failed the usage schema; stored without token counts`;
           summary.errors.push(note);
           progress.errors.push(note);
         }

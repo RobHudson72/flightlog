@@ -193,6 +193,7 @@ export async function ingestCodexFile(
     messagesAdded: 0,
     blocksAdded: 0,
     malformedLines: 0,
+    usageRefusedLines: 0,
     skippedLineTypes: {},
     skippedContentTypes: {},
   };

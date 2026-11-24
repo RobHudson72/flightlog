@@ -62,6 +62,67 @@ interface Usage {
   cacheCreation: number;
 }
 
+type UsageRefusalReason = 'schema' | 'synthetic-nonzero';
+
+type UsageRead =
+  | { ok: false; reason: UsageRefusalReason }
+  | {
+      ok: true;
+      synthetic: boolean;
+      timestamp: string;
+      model: string;
+      messageId: string;
+      requestId: string | undefined;
+      usage: Usage;
+    };
+
+/** Runs recordSchema on a usage-bearing line and applies the synthetic-line rule. */
+function readUsageRecord(json: unknown): UsageRead {
+  const rec = recordSchema.safeParse(json);
+  if (!rec.success) return { ok: false, reason: 'schema' };
+  const { message, requestId } = rec.data;
+  const usage: Usage = {
+    input: message.usage.input_tokens,
+    output: message.usage.output_tokens,
+    cacheRead: message.usage.cache_read_input_tokens,
+    cacheCreation: message.usage.cache_creation_input_tokens,
+  };
+  const synthetic = message.model === SYNTHETIC_MODEL;
+  if (synthetic && usage.input + usage.output + usage.cacheRead + usage.cacheCreation !== 0) {
+    return { ok: false, reason: 'synthetic-nonzero' };
+  }
+  return {
+    ok: true,
+    synthetic,
+    timestamp: rec.data.timestamp,
+    model: message.model,
+    messageId: message.id,
+    requestId,
+    usage,
+  };
+}
+
+export type UsageRecordResult =
+  | { ok: true; input: number; output: number; cacheRead: number; cacheCreation: number; synthetic: boolean }
+  | { ok: false; reason: UsageRefusalReason };
+
+/**
+ * The one parse point other modules use for a usage-bearing line (M1): flightlog's
+ * ingest stores a transcript line's token counts only through this.
+ */
+export function parseUsageRecord(line: unknown): UsageRecordResult {
+  const r = readUsageRecord(line);
+  if (!r.ok) return { ok: false, reason: r.reason };
+  return {
+    ok: true,
+    input: r.usage.input,
+    output: r.usage.output,
+    cacheRead: r.usage.cacheRead,
+    cacheCreation: r.usage.cacheCreation,
+    synthetic: r.synthetic,
+  };
+}
+
 type ParsedLine =
   | { kind: 'refused'; reason: string; timestamp: string | undefined }
   | { kind: 'other'; timestamp: string | undefined }
@@ -85,28 +146,16 @@ function parseLine(raw: string): ParsedLine {
     if (carriesUsage) return { kind: 'refused', reason: 'usage-on-non-assistant', timestamp };
     return { kind: 'other', timestamp };
   }
-  const rec = recordSchema.safeParse(json);
-  if (!rec.success) return { kind: 'refused', reason: 'schema', timestamp };
-  const { message, requestId } = rec.data;
-  const usage: Usage = {
-    input: message.usage.input_tokens,
-    output: message.usage.output_tokens,
-    cacheRead: message.usage.cache_read_input_tokens,
-    cacheCreation: message.usage.cache_creation_input_tokens,
-  };
-  if (message.model === SYNTHETIC_MODEL) {
-    if (usage.input + usage.output + usage.cacheRead + usage.cacheCreation !== 0) {
-      return { kind: 'refused', reason: 'synthetic-nonzero', timestamp: rec.data.timestamp };
-    }
-    return { kind: 'synthetic', timestamp: rec.data.timestamp };
-  }
+  const rec = readUsageRecord(json);
+  if (!rec.ok) return { kind: 'refused', reason: rec.reason, timestamp };
+  if (rec.synthetic) return { kind: 'synthetic', timestamp: rec.timestamp };
   // recordSchema guarantees requestId for a non-synthetic line
   return {
     kind: 'response',
-    timestamp: rec.data.timestamp,
-    model: message.model,
-    pair: JSON.stringify([message.id, requestId]),
-    usage,
+    timestamp: rec.timestamp,
+    model: rec.model,
+    pair: JSON.stringify([rec.messageId, rec.requestId]),
+    usage: rec.usage,
   };
 }
 
